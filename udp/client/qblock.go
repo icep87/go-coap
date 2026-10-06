@@ -84,6 +84,52 @@ func isMixedQBlockOptions(opts message.Options) bool {
 	return hasQ && hasClassic
 }
 
+// handleQBlockServerRequestError rejects requests that the Q-Block server
+// cannot process safely. A nil cause classifies mixed Q-Block and classic
+// Block options; parser errors are handled only when they have an explicit
+// wire response policy.
+func (cc *Conn) handleQBlockServerRequestError(w *responsewriter.ResponseWriter[*Conn], req *pool.Message, cause error) bool {
+	if req.Code() < codes.GET || req.Code() >= codes.Code(32) {
+		return false
+	}
+
+	var responseCode codes.Code
+	switch {
+	case cause == nil && isMixedQBlockOptions(req.Options()):
+		responseCode = codes.BadOption
+	case errors.Is(cause, qblock.ErrMixedOptions):
+		responseCode = codes.BadOption
+	case cause == nil && req.Type() == message.Confirmable && (req.HasOption(message.QBlock1) || req.HasOption(message.QBlock2)):
+		// The disabled path historically rejects CON Q requests with Bad
+		// Option, even when their Q options are otherwise valid.
+		responseCode = codes.BadOption
+	case cause != nil && req.Type() == message.Confirmable:
+		// The disabled path historically rejects malformed CON Q requests with
+		// Bad Option. Keep that policy while sharing response formation/cache.
+		responseCode = codes.BadOption
+	default:
+		return false
+	}
+
+	if req.Type() != message.Confirmable && req.Type() != message.NonConfirmable {
+		return true
+	}
+	resp := w.Message()
+	resp.SetCode(responseCode)
+	resp.SetToken(req.Token())
+	if req.Type() == message.Confirmable {
+		resp.SetType(message.Acknowledgement)
+		resp.SetMessageID(req.MessageID())
+	} else {
+		resp.SetType(message.NonConfirmable)
+		resp.SetMessageID(cc.GetMessageID())
+	}
+	if err := cc.addResponseToCacheForMID(req.MessageID(), resp); err != nil {
+		cc.errors(fmt.Errorf("cannot cache Q-Block rejection: %w", err))
+	}
+	return true
+}
+
 // handleDisabledQBlock prevents unsupported fragments reaching application handlers.
 // Responses are not requests and must never elicit a Bad Option response.
 func (cc *Conn) handleDisabledQBlock(w *responsewriter.ResponseWriter[*Conn], req *pool.Message) bool {
@@ -109,22 +155,5 @@ func (cc *Conn) handleDisabledQBlock(w *responsewriter.ResponseWriter[*Conn], re
 		return true
 	}
 	// Use direct message setters so No-Response cannot suppress a critical-option error.
-	resp := w.Message()
-	resp.SetCode(codes.BadOption)
-	resp.SetToken(req.Token())
-	if req.Type() == message.Confirmable {
-		resp.SetType(message.Acknowledgement)
-		resp.SetMessageID(req.MessageID())
-	} else {
-		resp.SetType(message.NonConfirmable)
-		resp.SetMessageID(cc.GetMessageID())
-	}
-	cacheMID := resp.MessageID()
-	if req.Type() == message.NonConfirmable {
-		cacheMID = req.MessageID()
-	}
-	if err := cc.addResponseToCacheForMID(cacheMID, resp); err != nil {
-		cc.errors(fmt.Errorf("cannot cache Q-Block rejection: %w", err))
-	}
-	return true
+	return cc.handleQBlockServerRequestError(w, req, validationErr)
 }

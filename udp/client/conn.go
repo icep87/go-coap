@@ -1080,6 +1080,9 @@ func (cc *Conn) handleReq(w *responsewriter.ResponseWriter[*Conn], req *pool.Mes
 	}
 
 	w.Message().SetModified(false)
+	if cc.qblockClient != nil && cc.qblockClient.server != nil && cc.handleQBlockServerRequestError(w, req, nil) {
+		return
+	}
 	if cc.qblockClient != nil && cc.qblockClient.handleServerRequest(req) {
 		return
 	}

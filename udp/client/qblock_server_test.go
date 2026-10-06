@@ -694,6 +694,64 @@ func TestQBlockServerRejectsMalformedFirstFragmentWithoutState(t *testing.T) {
 	}
 }
 
+func TestQBlockEnabledServerRejectsMixedOptions(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		token   byte
+		request func(*serverHarness, *testing.T) *pool.Message
+		classic message.OptionID
+	}{
+		{
+			name:  "QBlock1 and Block1",
+			token: 1,
+			request: func(h *serverHarness, t *testing.T) *pool.Message {
+				return h.q1(t, 1, 0, false, 4, "body")
+			},
+			classic: message.Block1,
+		},
+		{
+			name:  "QBlock2 and Block2",
+			token: 2,
+			request: func(h *serverHarness, t *testing.T) *pool.Message {
+				return h.control(t, 2, 0, false, "tag-a")
+			},
+			classic: message.Block2,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			h := newServerHarness(t, qblock.DefaultManagerConfig(), qblockServerConfig{}, func(*responsewriter.ResponseWriter[*Conn], *pool.Message) {
+				calls++
+			})
+			before := h.snapshot()
+			request := tc.request(h, t)
+			request.SetOptionUint32(tc.classic, 0)
+			requestMID := request.MessageID()
+
+			h.ingest(request)
+
+			writes := h.session.writesSnapshot()
+			require.Len(t, writes, 1)
+			first := writes[0]
+			require.Equal(t, codes.BadOption, first.code)
+			require.Equal(t, message.NonConfirmable, first.typ)
+			require.NotEqual(t, requestMID, first.mid)
+			require.Equal(t, message.Token{tc.token}, first.token)
+			require.Zero(t, calls)
+			require.Equal(t, before, h.snapshot())
+
+			duplicate := tc.request(h, t)
+			duplicate.SetOptionUint32(tc.classic, 0)
+			duplicate.SetMessageID(requestMID)
+			h.ingest(duplicate)
+
+			require.Equal(t, []qblockTestWrite{first, first}, h.session.writesSnapshot())
+			require.Zero(t, calls)
+			require.Equal(t, before, h.snapshot())
+		})
+	}
+}
+
 func TestQBlockServerRetainsDeliveredQ1ForLaterDispatch(t *testing.T) {
 	h := newServerHarness(t, qblock.DefaultManagerConfig(), qblockServerConfig{}, nil)
 	h.ingest(h.q1(t, 1, 0, false, 4, "body"))

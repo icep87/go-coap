@@ -191,3 +191,23 @@ func TestQBlockServerCONMalformed(t *testing.T) {
 		})
 	}
 }
+
+func TestQBlockServerCONMixedProbe(t *testing.T) {
+	calls := 0
+	h := newServerHarness(t, qblock.DefaultManagerConfig(), qblockServerConfig{}, func(*responsewriter.ResponseWriter[*Conn], *pool.Message) {
+		calls++
+	})
+	request := conGET(t, h, 70, 1, 0)
+	request.SetOptionUint32(message.Block2, 0)
+
+	h.ingest(request)
+
+	writes := h.session.writesSnapshot()
+	require.Len(t, writes, 1)
+	require.Equal(t, codes.BadOption, writes[0].code)
+	require.Equal(t, message.Acknowledgement, writes[0].typ)
+	require.EqualValues(t, 70, writes[0].mid)
+	require.Equal(t, message.Token{1}, writes[0].token)
+	require.Zero(t, calls)
+	require.Equal(t, serverSnapshot{}, h.snapshot())
+}

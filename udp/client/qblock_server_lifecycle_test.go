@@ -266,34 +266,38 @@ func runQBlockPrivatePairedRolesTrace(t *testing.T, method codes.Code, automatic
 	duplicate.mid += 1000 // the same final Q1 under a distinct wire identity
 	deliverPairedQBlockWire(t, server, duplicate)
 	require.Equal(t, 1, calls)
-	if automatic {
-		require.Eventually(t, func() bool {
-			client.qblockClient.mu.Lock()
-			deadline, ok := client.qblockClient.nextDeadlineLocked()
-			client.qblockClient.mu.Unlock()
-			return ok && clientClock.activeTimer() && clientClock.deadline().Equal(deadline)
-		}, time.Second, time.Millisecond)
-		before := len(clientSession.historySnapshot())
-		clientClock.Advance(clientClock.deadline().Sub(clientClock.Now()))
-		require.Eventually(t, func() bool { return len(clientSession.historySnapshot()) > before }, time.Second, time.Millisecond)
-	} else {
-		now = now.Add(managerConfig.Transfer.NonReceiveTimeout)
-		client.CheckExpirations(now)
+	if len(received) == 0 {
+		if automatic {
+			require.Eventually(t, func() bool {
+				client.qblockClient.mu.Lock()
+				deadline, ok := client.qblockClient.nextDeadlineLocked()
+				client.qblockClient.mu.Unlock()
+				return ok && clientClock.activeTimer() && clientClock.deadline().Equal(deadline)
+			}, time.Second, time.Millisecond)
+			before := len(clientSession.historySnapshot())
+			clientClock.Advance(clientClock.deadline().Sub(clientClock.Now()))
+			require.Eventually(t, func() bool { return len(clientSession.historySnapshot()) > before }, time.Second, time.Millisecond)
+		} else {
+			now = now.Add(managerConfig.Transfer.NonReceiveTimeout)
+			client.CheckExpirations(now)
+		}
 	}
 	drainPairedQBlock(t, client, server, clientSession, serverSession, false)
-	if automatic {
-		require.Eventually(t, func() bool {
-			server.qblockClient.mu.Lock()
-			deadline, ok := server.qblockClient.nextDeadlineLocked()
-			server.qblockClient.mu.Unlock()
-			return ok && serverClock.activeTimer() && serverClock.deadline().Equal(deadline)
-		}, time.Second, time.Millisecond)
-		before := len(serverSession.historySnapshot())
-		serverClock.Advance(serverClock.deadline().Sub(serverClock.Now()))
-		require.Eventually(t, func() bool { return len(serverSession.historySnapshot()) > before }, time.Second, time.Millisecond)
-	} else {
-		now = now.Add(managerConfig.Transfer.NonTimeout)
-		server.CheckExpirations(now)
+	if len(received) == 0 {
+		if automatic {
+			require.Eventually(t, func() bool {
+				server.qblockClient.mu.Lock()
+				deadline, ok := server.qblockClient.nextDeadlineLocked()
+				server.qblockClient.mu.Unlock()
+				return ok && serverClock.activeTimer() && serverClock.deadline().Equal(deadline)
+			}, time.Second, time.Millisecond)
+			before := len(serverSession.historySnapshot())
+			serverClock.Advance(serverClock.deadline().Sub(serverClock.Now()))
+			require.Eventually(t, func() bool { return len(serverSession.historySnapshot()) > before }, time.Second, time.Millisecond)
+		} else {
+			now = now.Add(managerConfig.Transfer.NonTimeout)
+			server.CheckExpirations(now)
+		}
 	}
 	drainPairedQBlock(t, client, server, clientSession, serverSession, false)
 
@@ -307,7 +311,7 @@ func runQBlockPrivatePairedRolesTrace(t *testing.T, method codes.Code, automatic
 	require.Equal(t, 1, calls)
 
 	clientHistory := clientSession.historySnapshot()
-	var uploadTag, controlTag, controlToken []byte
+	var uploadTag, controlTag, controlToken, lastControlToken []byte
 	for _, wire := range clientHistory {
 		tag, _ := wire.options.GetBytes(message.RequestTag)
 		if wire.options.HasOption(message.QBlock1) {
@@ -318,6 +322,7 @@ func runQBlockPrivatePairedRolesTrace(t *testing.T, method codes.Code, automatic
 				controlTag = tag
 				controlToken = wire.token
 			}
+			lastControlToken = wire.token
 		}
 	}
 	require.NotEmpty(t, uploadTag)
@@ -335,7 +340,8 @@ func runQBlockPrivatePairedRolesTrace(t *testing.T, method codes.Code, automatic
 	require.GreaterOrEqual(t, len(responseTokens), 4)
 	require.Equal(t, duplicate.token, responseTokens[0])
 	require.Equal(t, duplicate.token, responseTokens[1])
-	require.Equal(t, message.Token(controlToken), responseTokens[len(responseTokens)-1])
+	require.NotEmpty(t, lastControlToken)
+	require.Equal(t, message.Token(lastControlToken), responseTokens[len(responseTokens)-1])
 
 	// Keep an outbound Q1 live while the server retains the first response, so
 	// both private roles must be cancelled by the close path.

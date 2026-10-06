@@ -543,6 +543,9 @@ func (c *qblockClient) executeServerPacingControlOrdered(id qblockWorkID, work q
 		c.mu.Unlock()
 		return c.executeOrdered(outputs), false
 	}
+	record.lastControl = control.Intent.Action
+	record.lastControl.Numbers = append([]uint32(nil), control.Intent.Action.Numbers...)
+	record.hasLastControl = true
 	outputs := c.manager.CommitControl(record.id, control.Intent.Revision, c.now())
 	remaining := work.Controls[1:]
 	if len(remaining) != 0 {

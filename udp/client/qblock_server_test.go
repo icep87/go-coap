@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -218,6 +219,154 @@ func TestQBlockServerDispatchAndHandoff(t *testing.T) {
 	require.Equal(t, uint32(1), h.snapshot().active)
 	h.ingest(h.q1(t, 2, 0, false, 4, "body"))
 	require.Equal(t, 1, calls)
+}
+
+func TestQBlockServerQ1DuplicateReplaysResponse(t *testing.T) {
+	mc := qblock.DefaultManagerConfig()
+	mc.Transfer.MaxPayloads = 1
+	var calls atomic.Int32
+	h := newServerHarness(t, mc, qblockServerConfig{}, func(w *responsewriter.ResponseWriter[*Conn], _ *pool.Message) {
+		calls.Add(1)
+		require.NoError(t, w.SetResponse(codes.Changed, message.TextPlain, bytes.NewReader(bytes.Repeat([]byte{'r'}, 16))))
+	})
+
+	h.ingest(h.q1(t, 1, 0, true, 32, "abcdefghijklmnop"))
+	require.Len(t, h.session.writesSnapshot(), 1)
+	firstContinue := h.session.writesSnapshot()[0]
+	require.Equal(t, codes.Continue, firstContinue.code)
+	require.Equal(t, message.Token{1}, firstContinue.token)
+
+	h.ingest(h.q1(t, 1, 0, true, 32, "XXXXXXXXXXXXXXXX"))
+	h.ingest(h.q1(t, 2, 0, true, 32, "YYYYYYYYYYYYYYYY"))
+	writes := h.session.writesSnapshot()
+	require.Len(t, writes, 3, "each duplicate of the stored set boundary must replay Continue")
+	for i, token := range []message.Token{{1}, {2}} {
+		write := writes[i+1]
+		require.Equal(t, codes.Continue, write.code)
+		require.Equal(t, token, write.token)
+		require.True(t, write.options.HasOption(message.QBlock1))
+		require.NotEqual(t, firstContinue.mid, write.mid)
+	}
+	require.Zero(t, calls.Load(), "a partial-body duplicate must not invoke the handler")
+	require.LessOrEqual(t, h.snapshot().metadataBytes, uint64(64<<10))
+
+	h.ingest(h.q1(t, 1, 1, false, 32, "qrstuvwxyzABCDEF"))
+	require.EqualValues(t, 1, calls.Load())
+	writes = h.session.writesSnapshot()
+	require.Len(t, writes, 4)
+	require.True(t, writes[3].options.HasOption(message.QBlock2))
+	require.Equal(t, message.Token{1}, writes[3].token)
+
+	h.ingest(h.q1(t, 1, 1, false, 32, "1111111111111111"))
+	h.ingest(h.q1(t, 3, 1, false, 32, "2222222222222222"))
+	h.advance(mc.Transfer.NonTimeout) // a second repair joins the sender's paced repair set
+	writes = h.session.writesSnapshot()
+	require.Len(t, writes, 6, "a completed upload duplicate must replay the retained Q2 response")
+	for i, token := range []message.Token{{1}, {3}} {
+		write := writes[i+4]
+		require.True(t, write.options.HasOption(message.QBlock2))
+		require.Equal(t, uint32(0), write.block)
+		require.Equal(t, token, write.token)
+		require.Equal(t, bytes.Repeat([]byte{'r'}, 16), write.payload)
+	}
+	require.EqualValues(t, 1, calls.Load())
+	require.LessOrEqual(t, h.snapshot().serverTokens, int(mc.MaxTokens))
+
+	h.advance(mc.Transfer.Lifetime)
+	snapshot := h.snapshot()
+	require.Zero(t, snapshot.active)
+	require.Zero(t, snapshot.managerTokens)
+	require.Zero(t, snapshot.managerBytes)
+	require.Zero(t, snapshot.serverTokens)
+	require.Zero(t, snapshot.reservations)
+	require.LessOrEqual(t, snapshot.metadataBytes, uint64(64<<10))
+}
+
+func TestQBlockServerQ1DuplicateDuringHandlerReplaysOnce(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	var calls atomic.Int32
+	h := newServerHarness(t, qblock.DefaultManagerConfig(), qblockServerConfig{}, func(w *responsewriter.ResponseWriter[*Conn], _ *pool.Message) {
+		calls.Add(1)
+		close(started)
+		<-release
+		require.NoError(t, w.SetResponse(codes.Changed, message.TextPlain, bytes.NewReader([]byte("response"))))
+	})
+	first := h.q1(t, 4, 0, false, 4, "body")
+	firstDone := make(chan struct{})
+	go func() {
+		h.ingest(first)
+		close(firstDone)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("application handler did not start")
+	}
+
+	h.ingest(h.q1(t, 5, 0, false, 4, "diff"))
+	require.EqualValues(t, 1, calls.Load())
+	require.True(t, h.serverTokenBound(5), "the duplicate token must stay reserved until the response is ready")
+	require.Empty(t, h.session.writesSnapshot(), "the Q2 response waits for the running handler")
+	close(release)
+	released = true
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("application handler did not settle")
+	}
+
+	writes := h.session.writesSnapshot()
+	require.Len(t, writes, 2, "the eventual response must be delivered for both original and duplicate tokens")
+	require.True(t, writes[0].options.HasOption(message.QBlock2))
+	require.Equal(t, message.Token{4}, writes[0].token)
+	require.True(t, writes[1].options.HasOption(message.QBlock2))
+	require.Equal(t, message.Token{5}, writes[1].token)
+	require.EqualValues(t, 1, calls.Load())
+}
+
+func TestQBlockServerQ1DuplicateReplyExpiryReleasesToken(t *testing.T) {
+	mc := qblock.DefaultManagerConfig()
+	mc.Transfer.MaxPayloads = 1
+	h := newServerHarness(t, mc, qblockServerConfig{}, nil)
+	h.ingest(h.q1(t, 6, 0, true, 32, "abcdefghijklmnop"))
+	h.ingest(h.q1(t, 7, 0, true, 32, "XXXXXXXXXXXXXXXX"))
+	require.True(t, h.serverTokenBound(7))
+
+	h.advance(mc.Transfer.Lifetime)
+	snapshot := h.snapshot()
+	require.Zero(t, snapshot.active)
+	require.Zero(t, snapshot.managerTokens)
+	require.Zero(t, snapshot.managerBytes)
+	require.Zero(t, snapshot.serverTokens)
+	require.Zero(t, snapshot.reservations)
+}
+
+func TestQBlockServerQ1DuplicateWriteFailureReleasesState(t *testing.T) {
+	var calls atomic.Int32
+	h := newServerHarness(t, qblock.DefaultManagerConfig(), qblockServerConfig{}, func(w *responsewriter.ResponseWriter[*Conn], _ *pool.Message) {
+		calls.Add(1)
+		require.NoError(t, w.SetResponse(codes.Changed, message.TextPlain, bytes.NewReader([]byte("response"))))
+	})
+	h.ingest(h.q1(t, 8, 0, false, 4, "body"))
+	require.Len(t, h.session.writesSnapshot(), 1)
+	h.session.writeErr = errors.New("duplicate response write failed")
+
+	h.ingest(h.q1(t, 9, 0, false, 4, "diff"))
+	snapshot := h.snapshot()
+	require.EqualValues(t, 1, calls.Load())
+	require.Len(t, h.session.writesSnapshot(), 2)
+	require.Zero(t, snapshot.active)
+	require.Zero(t, snapshot.managerTokens)
+	require.Zero(t, snapshot.managerBytes)
+	require.Zero(t, snapshot.serverTokens)
+	require.Zero(t, snapshot.reservations)
 }
 
 func TestQBlockServerFailedQ2WriteStillSuppressesDuplicateUpload(t *testing.T) {

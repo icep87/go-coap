@@ -66,9 +66,18 @@ func (s *qblockServer) handleQ1(msg *pool.Message) ([]qblock.Output, bool) {
 			s.client.mu.Unlock()
 			return nil, false
 		}
-		if record.executing {
+		if !sameQBlockMetadata(record.requestMetadata, fragment.Metadata) {
 			s.client.mu.Unlock()
 			return nil, false
+		}
+		if record.activeOperation != operation {
+			outputs, accepted := s.replayQ2ResponseLocked(record, fragment.Token)
+			s.client.mu.Unlock()
+			return outputs, accepted
+		}
+		if record.terminal {
+			s.client.mu.Unlock()
+			return nil, true
 		}
 		outputs := s.receiveLocked(record, fragment, msg)
 		s.client.mu.Unlock()
@@ -135,7 +144,7 @@ func (s *qblockServer) handleQ1(msg *pool.Message) ([]qblock.Output, bool) {
 	record := &qblockServerRecord{
 		ownedLease:      ownedLease,
 		responseCeiling: hint,
-		id:              id, workID: workID, operation: operation, activeOperation: operation, metadata: fragment.Metadata, options: options,
+		id:              id, workID: workID, operation: operation, activeOperation: operation, requestMetadata: fragment.Metadata, metadata: fragment.Metadata, options: options,
 		tokens: map[string]message.Token{string(fragment.Token): bytes.Clone(fragment.Token)}, replyToken: bytes.Clone(fragment.Token), code: msg.Code(), charged: charge,
 		generation: s.nextGen, mids: make(map[int32]struct{}), writeContext: writeContext, cancelWrite: cancelWrite,
 		writeExpires: now.Add(s.client.managerConfig.Transfer.Lifetime),
@@ -153,7 +162,7 @@ func (s *qblockServer) handleQ1(msg *pool.Message) ([]qblock.Output, bool) {
 }
 
 func (s *qblockServer) receiveLocked(record *qblockServerRecord, fragment qblock.Fragment, msg *pool.Message) []qblock.Output {
-	if fragment.Metadata.Size != record.metadata.Size || fragment.Metadata.SZX != record.metadata.SZX || fragment.Metadata.HasContentFormat != record.metadata.HasContentFormat || fragment.Metadata.ContentFormat != record.metadata.ContentFormat || !bytes.Equal(fragment.Metadata.Identity, record.metadata.Identity) {
+	if !sameQBlockMetadata(fragment.Metadata, record.requestMetadata) {
 		return s.client.manager.Cancel(record.id, errors.New("q-block request metadata changed"))
 	}
 	key := string(fragment.Token)
@@ -174,12 +183,60 @@ func (s *qblockServer) receiveLocked(record *qblockServerRecord, fragment qblock
 		return s.client.manager.Cancel(record.id, err)
 	}
 	after, _ := s.client.manager.ReceiverProgress(record.id)
+	for _, output := range outputs {
+		if output.Action.Kind == qblock.Duplicate {
+			record.queueDuplicateReplyToken(fragment.Token)
+			return outputs
+		}
+	}
 	s.acceptPacingFeedbackLocked(record, msg, after > before)
 	record.replyToken = bytes.Clone(fragment.Token)
 	if err := s.syncControlsLocked(record, now); err != nil {
 		return append(outputs, s.client.manager.Cancel(record.id, err)...)
 	}
 	return outputs
+}
+
+func sameQBlockMetadata(a, b qblock.Metadata) bool {
+	return a.Size == b.Size && a.SZX == b.SZX && a.HasContentFormat == b.HasContentFormat && a.ContentFormat == b.ContentFormat && bytes.Equal(a.Identity, b.Identity)
+}
+
+// replayQ2ResponseLocked treats a Q1 block received after response preparation
+// as a duplicate request and asks the retained Q2 sender to replay its first
+// payload set under that request's token. The caller holds client.mu.
+func (s *qblockServer) replayQ2ResponseLocked(record *qblockServerRecord, token message.Token) ([]qblock.Output, bool) {
+	if record == nil || record.terminal || record.id == 0 || s.byID[record.id] != record || len(token) == 0 {
+		return nil, true
+	}
+	key := string(token)
+	_, owned := record.tokens[key]
+	if !owned {
+		if uint64(len(record.tokens)) >= uint64(s.client.managerConfig.MaxTokens) {
+			return nil, true
+		}
+		if err := s.client.cc.claimToken(token, tokenOwnerQBlock); err != nil {
+			return nil, true
+		}
+	}
+	count := qblockClientBlockCount(record.metadata)
+	limit := min(count, s.client.managerConfig.Transfer.MaxPayloads)
+	numbers := make([]uint32, limit)
+	for i := range numbers {
+		numbers[i] = uint32(i)
+	}
+	outputs, err := s.client.manager.ControlWithToken(record.id, qblock.Control{Token: token, Missing: numbers}, s.client.now())
+	if err != nil {
+		if !owned {
+			s.client.cc.releaseToken(token, tokenOwnerQBlock)
+		}
+		return nil, true
+	}
+	if !owned {
+		record.tokens[key] = bytes.Clone(token)
+	}
+	record.replyToken = bytes.Clone(token)
+	record.queueReplyTokens(outputs, token)
+	return outputs, true
 }
 
 // syncControlsLocked copies the current deferred Q1 control revision and its

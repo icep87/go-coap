@@ -204,6 +204,33 @@ func TestManagerControlWithTokenBindsAcceptedRepairButNotNoopContinue(t *testing
 	require.Equal(t, id, m.byToken[string(message.Token{3})])
 }
 
+func TestManagerContinueAfterRepairResponseAdvancesSender(t *testing.T) {
+	cfg := DefaultManagerConfig()
+	cfg.Transfer.MaxPayloads = 2
+	m, err := NewManager(cfg)
+	require.NoError(t, err)
+	now := time.Unix(100, 0)
+	operation, err := NewOperationKey([]byte("response"), []byte("tag"))
+	require.NoError(t, err)
+	outputs, err := m.StartSender(operation, message.Token{1}, Q2,
+		Metadata{Size: 48, SZX: blockwise.SZX16, Identity: []byte("etag")},
+		bytes.Repeat([]byte{'r'}, 48), now, 0)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{0, 1}, outputNumbers(outputs))
+
+	outputs, err = m.Control(Control{Token: message.Token{1}, Missing: []uint32{0}}, now)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{0}, outputNumbers(outputs))
+	outputs, err = m.Control(Control{Token: message.Token{1}, Missing: []uint32{1}}, now.Add(time.Second))
+	require.NoError(t, err)
+	require.Empty(t, outputs, "a later repair joins the active repair set")
+
+	through := uint32(1)
+	outputs, err = m.Control(Control{Token: message.Token{1}, Continue: &through}, now.Add(time.Second))
+	require.NoError(t, err)
+	require.Equal(t, []uint32{2}, outputNumbers(outputs), "feedback for the repaired set must release the next initial set")
+}
+
 func TestManagerRejectsConflictsAndReleasesSender(t *testing.T) {
 	cfg := DefaultManagerConfig()
 	cfg.Transfer.MaxBodySize = 16

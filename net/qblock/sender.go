@@ -96,8 +96,14 @@ func (s *Sender) Continue(through uint32, now time.Time) ([]Action, error) {
 	if !now.Before(s.expires) {
 		return s.Cancel(ErrExpired), nil
 	}
-	if s.repairActive || through != s.through || s.next >= s.count {
+	if through != s.through || s.next >= s.count {
 		return nil, nil
+	}
+	// Continue acknowledges the current set, so queued repairs in that set are
+	// obsolete. Do not drop valid progress merely because a repair was active.
+	if s.repairActive {
+		s.repairs = nil
+		s.repairActive = false
 	}
 	return s.sendInitial(now), nil
 }

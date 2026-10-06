@@ -40,40 +40,45 @@ type qblockServer struct {
 }
 
 type qblockServerRecord struct {
-	requestMID      int32
-	requestSequence uint64
-	requestControl  *coapNet.ControlMessage
-	requestToken    message.Token
-	ownedLease      *qblockOwnedLease
-	id              qblock.TransferID
-	workID          qblockWorkID
-	bodyProbeKey    qblockProbeKey
-	bodyAnswered    bool
-	operation       qblock.OperationKey
-	activeOperation qblock.OperationKey
-	responseCeiling *qblock.Block
-	metadata        qblock.Metadata
-	options         message.Options
-	tokens          map[string]message.Token
-	replyToken      message.Token
-	payload         []byte
-	ready           bool
-	executing       bool
-	code            codes.Code
-	responseCode    codes.Code
-	responseOptions message.Options
-	pendingReplies  map[qblockServerReplyKey][]message.Token
-	charged         uint64
-	responseCharged uint64
-	generation      uint64
-	mids            map[int32]struct{}
-	handlerRunning  bool
-	terminal        bool
-	writeExpires    time.Time
-	expires         time.Time
-	retainUntil     time.Time
-	writeContext    context.Context
-	cancelWrite     context.CancelFunc
+	requestMID             int32
+	requestSequence        uint64
+	requestControl         *coapNet.ControlMessage
+	requestToken           message.Token
+	ownedLease             *qblockOwnedLease
+	id                     qblock.TransferID
+	workID                 qblockWorkID
+	bodyProbeKey           qblockProbeKey
+	bodyAnswered           bool
+	operation              qblock.OperationKey
+	activeOperation        qblock.OperationKey
+	responseCeiling        *qblock.Block
+	requestMetadata        qblock.Metadata
+	metadata               qblock.Metadata
+	options                message.Options
+	tokens                 map[string]message.Token
+	replyToken             message.Token
+	pendingDuplicateTokens []message.Token
+	pendingDuplicateSet    map[string]struct{}
+	lastControl            qblock.Action
+	hasLastControl         bool
+	payload                []byte
+	ready                  bool
+	executing              bool
+	code                   codes.Code
+	responseCode           codes.Code
+	responseOptions        message.Options
+	pendingReplies         map[qblockServerReplyKey][]message.Token
+	charged                uint64
+	responseCharged        uint64
+	generation             uint64
+	mids                   map[int32]struct{}
+	handlerRunning         bool
+	terminal               bool
+	writeExpires           time.Time
+	expires                time.Time
+	retainUntil            time.Time
+	writeContext           context.Context
+	cancelWrite            context.CancelFunc
 }
 
 // qblockServerReplyKey groups Q2 payload actions for reply-token lookup.
@@ -113,6 +118,45 @@ func (r *qblockServerRecord) takeReplyToken(action qblock.Action) message.Token 
 		return bytes.Clone(token)
 	}
 	return bytes.Clone(r.replyToken)
+}
+
+func (r *qblockServerRecord) queueDuplicateReplyToken(token message.Token) {
+	key := string(token)
+	if r.pendingDuplicateSet == nil {
+		r.pendingDuplicateSet = make(map[string]struct{})
+	}
+	if _, exists := r.pendingDuplicateSet[key]; exists {
+		return
+	}
+	r.pendingDuplicateSet[key] = struct{}{}
+	r.pendingDuplicateTokens = append(r.pendingDuplicateTokens, bytes.Clone(token))
+}
+
+func (r *qblockServerRecord) takeDuplicateReplyToken() message.Token {
+	if len(r.pendingDuplicateTokens) == 0 {
+		return nil
+	}
+	token := r.pendingDuplicateTokens[0]
+	r.pendingDuplicateTokens = r.pendingDuplicateTokens[1:]
+	delete(r.pendingDuplicateSet, string(token))
+	if len(r.pendingDuplicateTokens) == 0 {
+		r.pendingDuplicateTokens = nil
+		r.pendingDuplicateSet = nil
+	}
+	return bytes.Clone(token)
+}
+
+func (r *qblockServerRecord) takeAllDuplicateReplyTokens() []message.Token {
+	if len(r.pendingDuplicateTokens) == 0 {
+		return nil
+	}
+	tokens := make([]message.Token, len(r.pendingDuplicateTokens))
+	for i, token := range r.pendingDuplicateTokens {
+		tokens[i] = bytes.Clone(token)
+	}
+	r.pendingDuplicateTokens = nil
+	r.pendingDuplicateSet = nil
+	return tokens
 }
 
 func withQBlockServer(cfg qblockServerConfig) Option {
@@ -246,7 +290,11 @@ func (s *qblockServer) deactivateLocked(record *qblockServerRecord, now time.Tim
 		s.client.cc.releaseToken(token, tokenOwnerQBlock)
 		delete(record.tokens, key)
 	}
+	record.pendingDuplicateTokens = nil
+	record.pendingDuplicateSet = nil
 	record.pendingReplies = nil
+	record.lastControl = qblock.Action{}
+	record.hasLastControl = false
 	s.releaseResponseMetadataLocked(record)
 	record.terminal = true
 	if record.workID != 0 {
@@ -502,6 +550,40 @@ func (c *qblockClient) executeServerOutput(output qblock.Output) []qblockCallbac
 		outputs := c.manager.Cancel(record.id, errors.New("unexpected immediate q-block server control"))
 		c.mu.Unlock()
 		return c.executeOrdered(outputs)
+	case qblock.Duplicate:
+		if record.executing {
+			c.mu.Unlock()
+			return nil
+		}
+		token := record.takeDuplicateReplyToken()
+		if len(token) == 0 {
+			c.mu.Unlock()
+			return nil
+		}
+		action, ok := record.lastControl, record.hasLastControl
+		if pending := c.manager.PendingControls(record.id); len(pending) != 0 {
+			action, ok = pending[0].Action, true
+		}
+		if !ok {
+			c.mu.Unlock()
+			return nil
+		}
+		mid := c.cc.GetMessageID()
+		if err := c.server.bindMIDLocked(record, mid); err != nil {
+			outputs := c.manager.Cancel(record.id, err)
+			c.mu.Unlock()
+			return c.executeOrdered(outputs)
+		}
+		writeContext := record.writeContext
+		szx := record.metadata.SZX
+		c.mu.Unlock()
+		if err := c.writeServerQ1Control(writeContext, token, mid, szx, action, 0); err != nil {
+			c.mu.Lock()
+			outputs := c.manager.Cancel(output.TransferID, err)
+			c.mu.Unlock()
+			return c.executeOrdered(outputs)
+		}
+		return nil
 	case qblock.SendBlock:
 		token := record.takeReplyToken(output.Action)
 		probeKey := qblockProbeKey(0)
@@ -604,6 +686,7 @@ func (s *qblockServer) finishHandler(operation qblock.OperationKey, generation u
 	if err := s.prepareResponseLocked(record, code, options, payload, c.now(), c.jitter()); err == nil {
 		c.mu.Unlock()
 		callbacks := c.executePendingOrdered(c.now())
+		callbacks = append(callbacks, s.replayPendingQ1Duplicates(operation, generation)...)
 		c.actionMu.Unlock()
 		actionLocked = false
 		c.notifyDeadlineChanged()
@@ -616,6 +699,33 @@ func (s *qblockServer) finishHandler(operation qblock.OperationKey, generation u
 	// Keep a bounded duplicate record even when no representation can be sent.
 	s.deactivateLocked(record, c.now())
 	c.mu.Unlock()
+}
+
+// replayPendingQ1Duplicates runs after the first Q2 response set has been
+// emitted. Duplicates received while the application handler ran are replayed
+// through the retained sender, keeping payload storage and Q-Block controls in
+// the existing manager.
+func (s *qblockServer) replayPendingQ1Duplicates(operation qblock.OperationKey, generation uint64) []qblockCallback {
+	c := s.client
+	c.mu.Lock()
+	record := s.records[operation]
+	if record == nil || record.generation != generation || record.terminal || record.activeOperation == operation {
+		c.mu.Unlock()
+		return nil
+	}
+	tokens := record.takeAllDuplicateReplyTokens()
+	c.mu.Unlock()
+
+	var callbacks []qblockCallback
+	for _, token := range tokens {
+		c.mu.Lock()
+		outputs, accepted := s.replayQ2ResponseLocked(record, token)
+		c.mu.Unlock()
+		if accepted && len(outputs) != 0 {
+			callbacks = append(callbacks, c.executeOrdered(outputs)...)
+		}
+	}
+	return callbacks
 }
 
 func (s *qblockServer) prepareResponseLocked(record *qblockServerRecord, code codes.Code, options message.Options, payload []byte, now time.Time, jitter float64) error {
@@ -772,6 +882,8 @@ func (s *qblockServer) releaseLocked(record *qblockServerRecord) {
 		s.client.cc.releaseToken(token, tokenOwnerQBlock)
 		delete(record.tokens, key)
 	}
+	record.pendingDuplicateTokens = nil
+	record.pendingDuplicateSet = nil
 	if s.metadata >= record.charged {
 		s.metadata -= record.charged
 	}

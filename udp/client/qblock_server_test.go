@@ -798,11 +798,16 @@ func TestQBlockServerRejectsMalformedFirstFragmentWithoutState(t *testing.T) {
 			h.ingest(msg)
 
 			require.Equal(t, before, h.snapshot())
-			if name == "missing request tag" || name == "missing size" {
+			switch name {
+			case "missing request tag", "missing size":
 				writes := h.session.writesSnapshot()
 				require.Len(t, writes, 1)
 				require.Equal(t, codes.BadRequest, writes[0].code)
-			} else {
+			case "mixed classic block":
+				writes := h.session.writesSnapshot()
+				require.Len(t, writes, 1)
+				require.Equal(t, codes.BadOption, writes[0].code)
+			default:
 				require.Empty(t, h.session.writesSnapshot())
 			}
 		})
@@ -968,14 +973,27 @@ func TestQBlockServerMetadataConflictCancelsOnlyResolvedReceiver(t *testing.T) {
 	require.NoError(t, err)
 	operation, err := serverRequestKey(codes.POST, options)
 	require.NoError(t, err)
-	for existing := range h.cc.qblockClient.server.records {
-		require.Equal(t, existing, operation)
-	}
+	_, resolved := h.cc.qblockClient.server.records[operation]
+	require.True(t, resolved)
+	unrelated := h.q1(t, 3, 0, true, 32, "ponmlkjihgfedcba")
+	require.NoError(t, unrelated.SetPath("/other"))
+	unrelatedOptions, err := canonicalServerRequestOptions(unrelated.Options())
+	require.NoError(t, err)
+	unrelatedOperation, err := serverRequestKey(codes.POST, unrelatedOptions)
+	require.NoError(t, err)
+	require.NotEqual(t, operation, unrelatedOperation)
+	h.ingest(unrelated)
+	require.Equal(t, uint32(2), h.snapshot().active)
 	conflict.SetBody(bytes.NewReader([]byte("qrstuvwxyzabcdef")))
 
 	h.ingest(conflict)
 
-	require.Equal(t, serverSnapshot{}, h.snapshot())
+	require.Equal(t, uint32(1), h.snapshot().active)
+	require.Equal(t, 1, h.snapshot().records)
+	_, resolved = h.cc.qblockClient.server.records[operation]
+	require.False(t, resolved)
+	_, remains := h.cc.qblockClient.server.records[unrelatedOperation]
+	require.True(t, remains)
 }
 
 func TestQBlockServerSameTagDifferentRequestIdentityAdmitsBoth(t *testing.T) {

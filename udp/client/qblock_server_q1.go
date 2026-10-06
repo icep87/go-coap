@@ -66,11 +66,11 @@ func (s *qblockServer) handleQ1(msg *pool.Message) ([]qblock.Output, bool) {
 			s.client.mu.Unlock()
 			return nil, false
 		}
-		if !sameQBlockMetadata(record.requestMetadata, fragment.Metadata) {
-			s.client.mu.Unlock()
-			return nil, false
-		}
 		if record.activeOperation != operation {
+			if !sameQBlockMetadata(record.requestMetadata, fragment.Metadata) {
+				s.client.mu.Unlock()
+				return nil, false
+			}
 			outputs, accepted := s.replayQ2ResponseLocked(record, fragment.Token)
 			s.client.mu.Unlock()
 			return outputs, accepted

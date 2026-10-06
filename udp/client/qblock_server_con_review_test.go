@@ -21,7 +21,10 @@ func TestQBlockServerCONReviewInvalidETag(t *testing.T) {
 		h.ingest(conGET(t, h, 70, 1, 0))
 		writes := h.session.writesSnapshot()
 		require.Len(t, writes, 1)
-		require.Equal(t, codes.InternalServerError, writes[0].code)
+		require.Equal(t, codes.Content, writes[0].code)
+		etag, err := writes[0].options.GetBytes(message.ETag)
+		require.NoError(t, err)
+		require.Len(t, etag, 8)
 	}
 }
 func TestQBlockServerCONReviewMetadataAggregate(t *testing.T) {

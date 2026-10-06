@@ -318,6 +318,7 @@ func TestQBlockPacedFullRecoveryBatchFitsReservedCapacity(t *testing.T) {
 	cc.qblockClient.workQueue.maxBytes = cc.qblockClient.workQueue.used
 	cc.qblockClient.mu.Unlock()
 	fragment := newQBlockClientFragment(t, cc, token, 10, true, 192)
+	fragment.SetOptionUint32(message.MaxAge, uint32(time.Hour/time.Second))
 	require.True(t, cc.qblockClient.handle(fragment))
 	cc.ReleaseMessage(fragment)
 	require.Equal(t, uint32(1), cc.qblockClient.active(), "reserved bytes must cover the full recovery intent")

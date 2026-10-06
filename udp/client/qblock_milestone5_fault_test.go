@@ -39,7 +39,7 @@ func TestQBlockMilestone5CrossSetAndReorder(t *testing.T) {
 				}
 				l, e := qblocklink.New(rules, qblocklink.Limits{MaxEvents: 2048, MaxBytes: 1 << 20})
 				require.NoError(t, e)
-				runQBlockPacingPairedScenario(t, method.code, &qblockPacingConfig{ProbingRate: 1024, NonProbingWait: time.Second, MaxIntentBytes: 1 << 20}, 2*time.Minute, l, 80, reorder)
+				runQBlockPacingPairedGeometry(t, method.code, &qblockPacingConfig{ProbingRate: 1024, NonProbingWait: time.Second, MaxIntentBytes: 1 << 20}, 2*time.Minute, l, 80, reorder, 2)
 				trace := l.Trace()
 				if reorder {
 					require.Equal(t, qblocklink.Hold, trace[0].Action)

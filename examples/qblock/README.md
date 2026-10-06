@@ -78,6 +78,9 @@ Defaults come from `qblock.DefaultClientConfig` and
 | Server retained metadata per connection | 64 KiB |
 | Server endpoint peers / connections / members | 1024 / 1024 / 4096 |
 
+Both peers must use the same `MAX_PAYLOADS` value (default 10). RFC 9177 does
+not negotiate this parameter, so configure matching values at both endpoints.
+
 `MaxOwnedBytes` is a separate adapter reservation limit. Zero derives its
 conservative reservation floor from the selected transport and configuration;
 it does not mean unlimited memory. Manager retained-byte limits count sender

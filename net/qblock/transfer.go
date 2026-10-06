@@ -40,6 +40,8 @@ type Action struct {
 
 // TransferConfig bounds and times one Q-Block transfer.
 type TransferConfig struct {
+	// MaxPayloads is the number of Q-Block payloads in a pacing set. Both peers
+	// must use the same value; RFC 9177 defaults it to 10 and does not negotiate it.
 	MaxPayloads       uint32
 	MaxBodySize       uint32
 	NonTimeout        time.Duration

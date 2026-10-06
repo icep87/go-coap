@@ -1545,6 +1545,217 @@ func TestConnDeliversCompleteQBlockResponseThroughOriginalHandler(t *testing.T) 
 	require.Zero(t, cc.qblockClient.active())
 }
 
+type qblockMaxAgeExchangeTest struct {
+	cc            *Conn
+	clock         *fakeQBlockClock
+	failures      chan error
+	originalToken message.Token
+	responseToken message.Token
+	q1Upload      bool
+}
+
+func newQBlockMaxAgeExchangeTest(t *testing.T, lifetime time.Duration, q1Upload bool) *qblockMaxAgeExchangeTest {
+	t.Helper()
+	clock := newFakeQBlockClock(time.Unix(100, 0))
+	session := &qblockTestSession{ctx: context.Background()}
+	manager := qblock.DefaultManagerConfig()
+	manager.Transfer.Lifetime = lifetime
+	cc := newQBlockClockTestConnWithSession(t, session, qblockClientConfig{
+		Manager: manager, Clock: clock, ScheduleMode: qblockScheduleManual,
+	})
+	originalToken := message.Token{0xd0}
+	var request *pool.Message
+	if q1Upload {
+		request = newPOSTWithBody(t, cc, originalToken, bytes.Repeat([]byte{'u'}, 16))
+	} else {
+		request = newPrivateQBlockClientGET(t, cc, originalToken)
+	}
+	failures := make(chan error, 1)
+	prepared, err := cc.qblockClient.prepare(request, func(err error) { failures <- err })
+	require.NoError(t, err)
+	require.True(t, prepared.Prepared)
+	cc.ReleaseMessage(request)
+	responseToken := originalToken
+	if q1Upload {
+		writes := session.writesSnapshot()
+		require.Len(t, writes, 1)
+		responseToken = writes[0].token
+	}
+	return &qblockMaxAgeExchangeTest{
+		cc: cc, clock: clock, failures: failures, originalToken: originalToken,
+		responseToken: responseToken, q1Upload: q1Upload,
+	}
+}
+
+func (e *qblockMaxAgeExchangeTest) fragment(t *testing.T, number uint32, more bool, size uint32, payload byte, maxAge *uint32) *pool.Message {
+	t.Helper()
+	var fragment *pool.Message
+	if e.q1Upload {
+		fragment = q2ResponseForPost(t, e.cc, e.responseToken, number, more, size, payload)
+	} else {
+		fragment = newQBlockClientFragment(t, e.cc, e.responseToken, number, more, size)
+		fragment.SetBody(bytes.NewReader(bytes.Repeat([]byte{payload}, 16)))
+	}
+	if maxAge != nil {
+		fragment.SetOptionUint32(message.MaxAge, *maxAge)
+	}
+	return fragment
+}
+
+func requireQBlockMaxAgeFailure(t *testing.T, failures <-chan error) {
+	t.Helper()
+	select {
+	case err := <-failures:
+		require.ErrorIs(t, err, qblock.ErrExpired)
+	default:
+		t.Fatal("expired Q2 request did not receive qblock.ErrExpired")
+	}
+}
+
+func requireQBlockPendingWorkQueueEmpty(t *testing.T, cc *Conn) {
+	t.Helper()
+	cc.qblockClient.mu.Lock()
+	defer cc.qblockClient.mu.Unlock()
+	require.Empty(t, cc.qblockClient.workQueue.slots)
+}
+
+func TestQBlockClientQ2PartialBodyMaxAgeDeadline(t *testing.T) {
+	zero, five, sixty := uint32(0), uint32(5), uint32(60)
+	for _, route := range []struct {
+		name     string
+		q1Upload bool
+	}{
+		{name: "Q2 GET response"},
+		{name: "Q1 upload response", q1Upload: true},
+	} {
+		for _, tc := range []struct {
+			name     string
+			lifetime time.Duration
+			maxAge   *uint32
+			deadline time.Duration
+		}{
+			{name: "Max-Age zero", lifetime: 30 * time.Second, maxAge: &zero},
+			{name: "Max-Age shorter than Lifetime", lifetime: 30 * time.Second, maxAge: &five, deadline: 5 * time.Second},
+			{name: "Max-Age longer than Lifetime", lifetime: 30 * time.Second, maxAge: &sixty, deadline: 30 * time.Second},
+			{name: "default Max-Age", lifetime: 90 * time.Second, deadline: 60 * time.Second},
+		} {
+			t.Run(route.name+"/"+tc.name, func(t *testing.T) {
+				exchange := newQBlockMaxAgeExchangeTest(t, tc.lifetime, route.q1Upload)
+				first := exchange.fragment(t, 0, true, 32, 'a', tc.maxAge)
+				exchange.cc.qblockClient.handle(first)
+				exchange.cc.ReleaseMessage(first)
+				require.Equal(t, uint32(1), exchange.cc.qblockClient.active())
+
+				if tc.deadline > 0 {
+					exchange.clock.Advance(tc.deadline - time.Nanosecond)
+					exchange.cc.qblockClient.Tick(exchange.clock.Now())
+					require.Equal(t, uint32(1), exchange.cc.qblockClient.active())
+					exchange.clock.Advance(time.Nanosecond)
+				}
+				exchange.cc.qblockClient.Tick(exchange.clock.Now())
+				requireQBlockMaxAgeFailure(t, exchange.failures)
+				requireQBlockClientFullyIdle(t, exchange.cc.qblockClient)
+				requireQBlockPendingWorkQueueEmpty(t, exchange.cc)
+			})
+		}
+	}
+}
+
+func TestQBlockClientQ2PartialBodyMaxAgeCannotExtendDeadline(t *testing.T) {
+	five, thirty := uint32(5), uint32(30)
+	exchange := newQBlockMaxAgeExchangeTest(t, 30*time.Second, false)
+	first := exchange.fragment(t, 0, true, 48, 'a', &five)
+	exchange.cc.qblockClient.handle(first)
+	exchange.cc.ReleaseMessage(first)
+	exchange.clock.Advance(3 * time.Second)
+	exchange.cc.qblockClient.Tick(exchange.clock.Now())
+	second := exchange.fragment(t, 1, true, 48, 'b', &thirty)
+	exchange.cc.qblockClient.handle(second)
+	exchange.cc.ReleaseMessage(second)
+
+	exchange.cc.qblockClient.mu.Lock()
+	transfer := exchange.cc.qblockClient.transferByToken[string(exchange.responseToken)]
+	var expires time.Time
+	if transfer != nil {
+		expires = transfer.expires
+	}
+	exchange.cc.qblockClient.mu.Unlock()
+	require.NotNil(t, transfer)
+	require.Equal(t, time.Unix(105, 0), expires)
+	require.Equal(t, uint32(1), exchange.cc.qblockClient.active())
+
+	exchange.clock.Advance(2 * time.Second)
+	exchange.cc.qblockClient.Tick(exchange.clock.Now())
+	requireQBlockMaxAgeFailure(t, exchange.failures)
+	requireQBlockClientFullyIdle(t, exchange.cc.qblockClient)
+	requireQBlockPendingWorkQueueEmpty(t, exchange.cc)
+}
+
+func TestQBlockClientQ2ExpiredBeforeLateFragment(t *testing.T) {
+	five, thirty := uint32(5), uint32(30)
+	exchange := newQBlockMaxAgeExchangeTest(t, 30*time.Second, false)
+	delivered := make(chan *pool.Message, 1)
+	exchange.cc.tokenHandlerContainer.Store(exchange.originalToken.Hash(), func(_ *responsewriter.ResponseWriter[*Conn], msg *pool.Message) {
+		msg.Hijack()
+		delivered <- msg
+	})
+	first := exchange.fragment(t, 0, true, 32, 'a', &five)
+	exchange.cc.qblockClient.handle(first)
+	exchange.cc.ReleaseMessage(first)
+	exchange.clock.Advance(5 * time.Second)
+	late := exchange.fragment(t, 1, false, 32, 'b', &thirty)
+	exchange.cc.qblockClient.handle(late)
+	exchange.cc.ReleaseMessage(late)
+
+	select {
+	case response := <-delivered:
+		exchange.cc.ReleaseMessage(response)
+		t.Fatal("late final fragment completed an expired Q2 body")
+	default:
+	}
+	requireQBlockMaxAgeFailure(t, exchange.failures)
+	requireQBlockClientFullyIdle(t, exchange.cc.qblockClient)
+	requireQBlockPendingWorkQueueEmpty(t, exchange.cc)
+}
+
+func TestQBlockClientQ2CompleteBodyBeforeExpiry(t *testing.T) {
+	five, thirty := uint32(5), uint32(30)
+	exchange := newQBlockMaxAgeExchangeTest(t, 30*time.Second, false)
+	delivered := make(chan *pool.Message, 1)
+	calls := 0
+	exchange.cc.tokenHandlerContainer.Store(exchange.originalToken.Hash(), func(_ *responsewriter.ResponseWriter[*Conn], msg *pool.Message) {
+		calls++
+		msg.Hijack()
+		delivered <- msg
+	})
+	first := exchange.fragment(t, 0, true, 32, 'a', &five)
+	exchange.cc.qblockClient.handle(first)
+	exchange.cc.ReleaseMessage(first)
+	exchange.clock.Advance(3 * time.Second)
+	last := exchange.fragment(t, 1, false, 32, 'b', &thirty)
+	exchange.cc.qblockClient.handle(last)
+	exchange.cc.ReleaseMessage(last)
+
+	select {
+	case response := <-delivered:
+		defer exchange.cc.ReleaseMessage(response)
+		body, err := io.ReadAll(response.Body())
+		require.NoError(t, err)
+		require.Equal(t, append(bytes.Repeat([]byte{'a'}, 16), bytes.Repeat([]byte{'b'}, 16)...), body)
+	default:
+		t.Fatal("completed Q2 body was not delivered before expiry")
+	}
+	require.Equal(t, 1, calls)
+	exchange.clock.Advance(3 * time.Second)
+	exchange.cc.qblockClient.Tick(exchange.clock.Now())
+	requireQBlockClientFullyIdle(t, exchange.cc.qblockClient)
+	select {
+	case err := <-exchange.failures:
+		t.Fatalf("completed Q2 body failed after delivery: %v", err)
+	default:
+	}
+}
+
 func TestConnDeliversSingleFragmentQBlockResponseThroughOriginalHandler(t *testing.T) {
 	cc := newPrivateQBlockClientConn(t)
 	req := newPrivateQBlockClientGET(t, cc, message.Token{15, 16, 17})

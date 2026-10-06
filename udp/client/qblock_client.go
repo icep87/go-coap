@@ -635,6 +635,17 @@ func (c *qblockClient) nextDeadlineLocked() (time.Time, bool) {
 		return time.Time{}, false
 	}
 	deadline, ok := c.manager.NextDeadline()
+	for id, transfer := range c.transfers {
+		if transfer.kind != qblock.Q2 || transfer.expires.IsZero() {
+			continue
+		}
+		if _, active := c.manager.ReceiverProgress(id); !active {
+			continue
+		}
+		if !ok || transfer.expires.Before(deadline) {
+			deadline, ok = transfer.expires, true
+		}
+	}
 	if c.workQueue != nil {
 		now := c.now()
 		c.clearExpiredPacingProbeLocked(now)
@@ -678,9 +689,21 @@ func (c *qblockClient) advanceDueWithCallbacks(now time.Time, scheduled bool) {
 		c.actionMu.Unlock()
 		return
 	}
-	outputs := c.manager.Tick(now)
+	var outputs []qblock.Output
+	for id, transfer := range c.transfers {
+		if transfer.kind != qblock.Q2 || now.Before(transfer.expires) {
+			continue
+		}
+		if _, active := c.manager.ReceiverProgress(id); active {
+			outputs = append(outputs, c.manager.Cancel(id, qblock.ErrExpired)...)
+		}
+	}
+	outputs = append(outputs, c.manager.Tick(now)...)
 	for id, transfer := range c.transfers {
 		if transfer.kind == qblock.Q2 {
+			if _, active := c.manager.ReceiverProgress(id); !active {
+				continue
+			}
 			if err := c.syncPacingControlsLocked(id, now); err != nil {
 				outputs = append(outputs, c.manager.Cancel(id, err)...)
 			}
@@ -1024,6 +1047,17 @@ func (c *qblockClient) handle(msg *pool.Message) bool {
 			progressed = true
 			return true
 		}
+		now := c.now()
+		if !now.Before(transfer.expires) {
+			if _, active := c.manager.ReceiverProgress(transfer.id); active {
+				outputs := c.manager.Cancel(transfer.id, qblock.ErrExpired)
+				c.mu.Unlock()
+				callbacks = append(callbacks, c.executeOrdered(outputs)...)
+				callbacks = append(callbacks, c.executePendingOrdered(now)...)
+				progressed = true
+				return true
+			}
+		}
 		fragment, _, err := fragmentFromQ2ForCode(msg, transfer.operation, &transfer.metadata, transfer.responseCode)
 		if err != nil {
 			outputs := c.manager.Cancel(transfer.id, err)
@@ -1032,7 +1066,6 @@ func (c *qblockClient) handle(msg *pool.Message) bool {
 			progressed = true
 			return true
 		}
-		now := c.now()
 		before, _ := c.manager.ReceiverProgress(transfer.id)
 		outputs, err := c.manager.Receive(fragment, now)
 		if err != nil {
@@ -1051,6 +1084,10 @@ func (c *qblockClient) handle(msg *pool.Message) bool {
 			}
 		}
 		if (stillActive && after > before) || acceptedDelivery {
+			candidate := qblockMaxAgeDeadline(msg, now, c.managerConfig.Transfer.Lifetime)
+			if candidate.Before(transfer.expires) {
+				transfer.expires = candidate
+			}
 			c.acceptPacingQ2ProgressLocked(transfer, fragment.Block.Number)
 		}
 		if err := c.syncPacingControlsLocked(transfer.id, now); err != nil {
@@ -1135,7 +1172,7 @@ func (c *qblockClient) handle(msg *pool.Message) bool {
 		responseOptions:  responseOptions,
 		responseCode:     msg.Code(),
 		requestTag:       cloneQBlockBytes(exchange.requestTag),
-		expires:          now.Add(c.managerConfig.Transfer.Lifetime),
+		expires:          qblockMaxAgeDeadline(msg, now, c.managerConfig.Transfer.Lifetime),
 	}
 	c.clearPendingGETMIDsLocked(exchange)
 	exchange.transfers[id] = struct{}{}
@@ -1311,7 +1348,7 @@ func (c *qblockClient) handoffQ1ToQ2Locked(id qblock.TransferID, msg *pool.Messa
 		mids:             make(map[int32]struct{}),
 		responseOptions:  responseOptions,
 		responseCode:     code,
-		expires:          now.Add(c.managerConfig.Transfer.Lifetime),
+		expires:          qblockMaxAgeDeadline(msg, now, c.managerConfig.Transfer.Lifetime),
 	}
 	exchange.transfers[receiverID] = struct{}{}
 	c.exchangeByTransfer[receiverID] = exchange
@@ -1342,6 +1379,22 @@ func qblockClientBlockCount(metadata qblock.Metadata) uint32 {
 		return 1
 	}
 	return uint32(count)
+}
+
+func qblockMaxAgeDeadline(msg *pool.Message, receivedAt time.Time, lifetime time.Duration) time.Time {
+	maxAge := uint32(60)
+	if msg != nil {
+		if value, err := msg.GetOptionUint32(message.MaxAge); err == nil {
+			maxAge = value
+		}
+	}
+
+	lifetimeDeadline := receivedAt.Add(lifetime)
+	maxAgeDeadline := receivedAt.Add(time.Duration(maxAge) * time.Second)
+	if maxAgeDeadline.Before(lifetimeDeadline) {
+		return maxAgeDeadline
+	}
+	return lifetimeDeadline
 }
 
 func (c *qblockClient) drive(outputs []qblock.Output) {

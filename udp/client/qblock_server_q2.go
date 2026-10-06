@@ -10,6 +10,8 @@ import (
 	"github.com/plgd-dev/go-coap/v3/net/qblock"
 )
 
+var errQBlock2SelectorOrder = errors.New("q-block2 selectors must have strictly increasing NUM values")
+
 // serverQ2Control preserves the singleton initial-GET contract.
 func serverQ2Control(msg *pool.Message) (qblock.OperationKey, qblock.Block, error) {
 	op, blocks, err := serverQ2Controls(msg, 1)
@@ -40,8 +42,13 @@ func serverQ2Controls(msg *pool.Message, limit uint32) (qblock.OperationKey, []q
 		if err != nil {
 			return "", nil, err
 		}
-		if len(blocks) != 0 && (block.Number <= blocks[len(blocks)-1].Number || block.SZX != blocks[0].SZX) {
-			return "", nil, errors.New("q-block2 selectors must increase with fixed size")
+		if len(blocks) != 0 {
+			if block.Number <= blocks[len(blocks)-1].Number {
+				return "", nil, errQBlock2SelectorOrder
+			}
+			if block.SZX != blocks[0].SZX {
+				return "", nil, errors.New("q-block2 selectors must use a fixed block size")
+			}
 		}
 		blocks = append(blocks, block)
 	}

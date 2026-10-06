@@ -99,6 +99,11 @@ func (cc *Conn) handleQBlockServerRequestError(w *responsewriter.ResponseWriter[
 		responseCode = codes.BadOption
 	case errors.Is(cause, qblock.ErrMixedOptions):
 		responseCode = codes.BadOption
+	case errors.Is(cause, errQBlock2SelectorOrder):
+		if req.Type() != message.NonConfirmable || !req.HasOption(message.QBlock2) {
+			return false
+		}
+		responseCode = codes.BadRequest
 	case cause == nil && req.Type() == message.Confirmable && (req.HasOption(message.QBlock1) || req.HasOption(message.QBlock2)):
 		// The disabled path historically rejects CON Q requests with Bad
 		// Option, even when their Q options are otherwise valid.

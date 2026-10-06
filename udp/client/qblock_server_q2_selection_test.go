@@ -114,8 +114,6 @@ func TestQBlockServerQ2SelectorsRejectAtomically(t *testing.T) {
 		name string
 		raw  []uint32
 	}{
-		{"descending", []uint32{0x40, 0x20}},
-		{"duplicate_num", []uint32{0x28, 0x20}},
 		{"mixed_szx", []uint32{0x20, 0x41}},
 		{"past_body", []uint32{0x20, 0xd0}},
 		{"unsent", []uint32{0x20, 0xa0}},
@@ -142,6 +140,56 @@ func TestQBlockServerQ2SelectorsRejectAtomically(t *testing.T) {
 			writes := h.session.writesSnapshot()
 			require.Len(t, writes, beforeWrites+1)
 			require.Equal(t, message.Token{11}, writes[len(writes)-1].token)
+		})
+	}
+}
+
+func TestQBlockServerQ2SelectorOrderReturnsBadRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  []uint32
+	}{
+		{"descending", []uint32{0x40, 0x20}},
+		{"duplicate_num", []uint32{0x28, 0x20}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, calls := q2SelectorHarness(t, 13)
+			before := h.snapshot()
+			beforeWrites := len(h.session.writesSnapshot())
+			h.cc.qblockClient.mu.Lock()
+			deadline, hasDeadline := h.cc.qblockClient.manager.NextDeadline()
+			h.cc.qblockClient.mu.Unlock()
+
+			request := q2Selectors(t, h, tc.raw...)
+			requestMID := request.MessageID()
+			h.ingest(request)
+
+			writes := h.session.writesSnapshot()
+			require.Len(t, writes, beforeWrites+1)
+			response := writes[beforeWrites]
+			require.Equal(t, codes.BadRequest, response.code)
+			require.Equal(t, message.NonConfirmable, response.typ)
+			require.NotEqual(t, requestMID, response.mid)
+			require.Equal(t, message.Token{11}, response.token)
+			require.Equal(t, before, h.snapshot())
+			require.False(t, h.serverTokenBound(11))
+			h.cc.qblockClient.mu.Lock()
+			afterDeadline, hasAfterDeadline := h.cc.qblockClient.manager.NextDeadline()
+			h.cc.qblockClient.mu.Unlock()
+			require.Equal(t, hasDeadline, hasAfterDeadline)
+			require.Equal(t, deadline, afterDeadline)
+
+			h.ingest(q2Selectors(t, h, 0x20))
+			writes = h.session.writesSnapshot()
+			require.Len(t, writes, beforeWrites+2)
+			repair := writes[len(writes)-1]
+			require.Equal(t, message.Token{11}, repair.token)
+			value, err := repair.options.GetUint32(message.QBlock2)
+			require.NoError(t, err)
+			block, err := qblock.DecodeBlock(value)
+			require.NoError(t, err)
+			require.Equal(t, uint32(2), block.Number)
+			require.Equal(t, 1, *calls)
 		})
 	}
 }

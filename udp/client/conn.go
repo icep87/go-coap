@@ -1080,8 +1080,16 @@ func (cc *Conn) handleReq(w *responsewriter.ResponseWriter[*Conn], req *pool.Mes
 	}
 
 	w.Message().SetModified(false)
-	if cc.qblockClient != nil && cc.qblockClient.server != nil && cc.handleQBlockServerRequestError(w, req, nil) {
-		return
+	if cc.qblockClient != nil && cc.qblockClient.server != nil {
+		if cc.handleQBlockServerRequestError(w, req, nil) {
+			return
+		}
+		if req.HasOption(message.QBlock2) && req.Type() == message.NonConfirmable {
+			_, _, err := serverQ2Controls(req, cc.qblockClient.managerConfig.Transfer.MaxPayloads)
+			if cc.handleQBlockServerRequestError(w, req, err) {
+				return
+			}
+		}
 	}
 	if cc.qblockClient != nil && cc.qblockClient.handleServerRequest(req) {
 		return

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -733,6 +734,11 @@ func (s *qblockServer) prepareResponseLocked(record *qblockServerRecord, code co
 	if record.workID == 0 || uint64(len(payload)) > math.MaxUint32 || c.nextProbeKey == qblockProbeKey(math.MaxUint64) {
 		return qblock.ErrLimitExceeded
 	}
+	etag, err := qblockServerResponseETag(code, options, payload)
+	if err != nil {
+		return err
+	}
+	options = qblockServerResponseOptions(options)
 	responseBytes, err := qblockOptionBytes(options)
 	if err != nil {
 		return err
@@ -744,12 +750,7 @@ func (s *qblockServer) prepareResponseLocked(record *qblockServerRecord, code co
 	if err != nil {
 		return err
 	}
-	hash := sha256.New()
-	_, _ = hash.Write([]byte{byte(code)})
-	_, _ = hash.Write(payload)
-	var etag [sha256.Size]byte
-	copy(etag[:], hash.Sum(etag[:0]))
-	meta := qblock.Metadata{Size: uint32(len(payload)), SZX: record.metadata.SZX, Identity: etag[:8], HasContentFormat: true, ContentFormat: message.TextPlain}
+	meta := qblock.Metadata{Size: uint32(len(payload)), SZX: record.metadata.SZX, Identity: etag, HasContentFormat: true, ContentFormat: message.TextPlain}
 	if record.responseCeiling != nil {
 		meta.SZX = record.responseCeiling.SZX
 	}
@@ -790,6 +791,78 @@ func (s *qblockServer) prepareResponseLocked(record *qblockServerRecord, code co
 	record.writeExpires = work.Expires
 	s.byID[id] = record
 	return nil
+}
+
+func qblockServerApplicationETag(options message.Options) ([]byte, bool) {
+	var value []byte
+	count := 0
+	for _, option := range options {
+		if option.ID != message.ETag {
+			continue
+		}
+		count++
+		value = option.Value
+	}
+	if count != 1 || len(value) < 1 || len(value) > 8 {
+		return nil, false
+	}
+	return bytes.Clone(value), true
+}
+
+func qblockServerResponseOptions(options message.Options) message.Options {
+	filtered := make(message.Options, 0, len(options))
+	for _, option := range options {
+		switch option.ID {
+		case message.QBlock1, message.QBlock2, message.Block1, message.Block2,
+			message.Size1, message.Size2, message.RequestTag, message.ETag:
+			continue
+		}
+		filtered = append(filtered, option)
+	}
+	return filtered
+}
+
+func qblockServerResponseETagPrefix(code codes.Code, options message.Options) ([]byte, error) {
+	canonical := qblockServerResponseOptions(options)
+	slices.SortStableFunc(canonical, func(a, b message.Option) int {
+		if a.ID < b.ID {
+			return -1
+		}
+		if a.ID > b.ID {
+			return 1
+		}
+		return 0
+	})
+	if _, err := qblockOptionBytes(canonical); err != nil {
+		return nil, err
+	}
+	// The fixed-width count, option number, and option lengths make the option
+	// sequence unambiguous before the body bytes are appended.
+	prefix := make([]byte, 1+8)
+	prefix[0] = byte(code)
+	binary.BigEndian.PutUint64(prefix[1:], uint64(len(canonical)))
+	var header [10]byte
+	for _, option := range canonical {
+		binary.BigEndian.PutUint16(header[:2], uint16(option.ID))
+		binary.BigEndian.PutUint64(header[2:], uint64(len(option.Value)))
+		prefix = append(prefix, header[:]...)
+		prefix = append(prefix, option.Value...)
+	}
+	return prefix, nil
+}
+
+func qblockServerResponseETag(code codes.Code, options message.Options, body []byte) ([]byte, error) {
+	if etag, ok := qblockServerApplicationETag(options); ok {
+		return etag, nil
+	}
+	prefix, err := qblockServerResponseETagPrefix(code, options)
+	if err != nil {
+		return nil, err
+	}
+	hash := sha256.New()
+	_, _ = hash.Write(prefix)
+	_, _ = hash.Write(body)
+	return bytes.Clone(hash.Sum(nil)[:8]), nil
 }
 
 func (c *qblockClient) writeServerQ2Block(writeContext context.Context, token message.Token, mid int32, code codes.Code, options message.Options, szx blockwise.SZX, size uint32, etag []byte, action qblock.Action, probeKey qblockProbeKey) error {

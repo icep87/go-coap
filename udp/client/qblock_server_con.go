@@ -243,11 +243,14 @@ func (s *qblockServer) captureCONResponse(r *qblockServerCONRecord, resp *pool.M
 		return s.simpleCONWire(r, codes.InternalServerError)
 	}
 	for _, opt := range resp.Options() {
+		if code == codes.Content && opt.ID == message.ETag {
+			continue
+		}
 		if def, ok := message.CoapOptionDefs[opt.ID]; ok && (uint32(len(opt.Value)) < def.MinLen || uint32(len(opt.Value)) > def.MaxLen) {
 			return s.simpleCONWire(r, codes.InternalServerError)
 		}
 	}
-	if qblockOptionCount(resp, message.ETag) > 1 {
+	if code != codes.Content && qblockOptionCount(resp, message.ETag) > 1 {
 		return s.simpleCONWire(r, codes.InternalServerError)
 	}
 	optionBytes, err := qblockOptionBytes(resp.Options())
@@ -270,7 +273,7 @@ func (s *qblockServer) captureCONResponse(r *qblockServerCONRecord, resp *pool.M
 			return uint32(s.client.datagramLimit)
 		}
 		return uint32(16) << block.SZX
-	}())
+	}(), code, resp.Options())
 	if err != nil {
 		return s.simpleCONWire(r, codes.InternalServerError)
 	}
@@ -283,13 +286,19 @@ func (s *qblockServer) captureCONResponse(r *qblockServerCONRecord, resp *pool.M
 	out.SetType(message.Acknowledgement)
 	out.SetMessageID(r.mid)
 	out.SetToken(r.token)
-	opts := make(message.Options, 0, len(resp.Options()))
-	for _, opt := range resp.Options() {
-		switch opt.ID {
-		case message.QBlock1, message.QBlock2, message.Block1, message.Block2, message.Observe, message.Size2:
-			continue
+	var opts message.Options
+	if code == codes.Content {
+		opts = qblockServerResponseOptions(resp.Options()).Remove(message.Observe)
+	} else {
+		// Preserve the existing CON error response policy.
+		opts = make(message.Options, 0, len(resp.Options()))
+		for _, opt := range resp.Options() {
+			switch opt.ID {
+			case message.QBlock1, message.QBlock2, message.Block1, message.Block2, message.Observe, message.Size2:
+				continue
+			}
+			opts = append(opts, opt)
 		}
-		opts = append(opts, opt)
 	}
 	out.ResetOptionsTo(opts)
 	if code == codes.Content {
@@ -297,9 +306,11 @@ func (s *qblockServer) captureCONResponse(r *qblockServerCONRecord, resp *pool.M
 		value, _ := qblock.EncodeBlock(block)
 		out.SetOptionUint32(message.QBlock2, value)
 		out.SetOptionUint32(message.Size2, size)
-		if !out.HasOption(message.ETag) {
-			out.SetOptionBytes(message.ETag, digest)
+		etag := digest
+		if applicationETag, ok := qblockServerApplicationETag(resp.Options()); ok {
+			etag = applicationETag
 		}
+		out.SetOptionBytes(message.ETag, etag)
 	} else {
 		// Error responses are bounded by the datagram and have no Q metadata.
 		if size > uint32(len(payload)) {
@@ -333,8 +344,13 @@ func (s *qblockServer) captureCONResponse(r *qblockServerCONRecord, resp *pool.M
 
 // Stream the representation once, retaining only the selected block and a
 // fixed scratch buffer; neither claimed size nor cursor drives allocations.
-func captureCONBody(body io.ReadSeeker, limit uint32, offset uint64, blockSize uint32) (payload []byte, size uint32, digest []byte, err error) {
+func captureCONBody(body io.ReadSeeker, limit uint32, offset uint64, blockSize uint32, code codes.Code, options message.Options) (payload []byte, size uint32, digest []byte, err error) {
+	prefix, err := qblockServerResponseETagPrefix(code, options)
+	if err != nil {
+		return nil, 0, nil, err
+	}
 	hash := sha256.New()
+	_, _ = hash.Write(prefix)
 	if body == nil {
 		return nil, 0, hash.Sum(nil)[:8], nil
 	}

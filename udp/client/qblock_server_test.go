@@ -406,6 +406,121 @@ func TestQBlockServerQ2BlocksUseStableRepresentationSize(t *testing.T) {
 	}
 }
 
+func q2ServerResponseWrites(t *testing.T, code codes.Code, body []byte, options ...message.Option) []qblockTestWrite {
+	t.Helper()
+	calls := 0
+	h := newServerHarness(t, qblock.DefaultManagerConfig(), qblockServerConfig{}, func(w *responsewriter.ResponseWriter[*Conn], _ *pool.Message) {
+		calls++
+		require.NoError(t, w.SetResponse(code, message.TextPlain, bytes.NewReader(body), options...))
+	})
+	h.ingest(h.q1(t, 1, 0, false, 4, "body"))
+	require.Equal(t, 1, calls)
+	return h.session.writesSnapshot()
+}
+
+func responseOptionCount(options message.Options, id message.OptionID) int {
+	count := 0
+	for _, option := range options {
+		if option.ID == id {
+			count++
+		}
+	}
+	return count
+}
+
+func requireCleanQ2ResponseOptions(t *testing.T, options message.Options) {
+	t.Helper()
+	require.Equal(t, 1, responseOptionCount(options, message.QBlock2))
+	require.Equal(t, 1, responseOptionCount(options, message.Size2))
+	require.Equal(t, 1, responseOptionCount(options, message.ETag))
+	for _, id := range []message.OptionID{message.QBlock1, message.Block1, message.Block2, message.Size1, message.RequestTag} {
+		require.Zero(t, responseOptionCount(options, id), "option %v must be removed from Q2 responses", id)
+	}
+}
+
+func TestQBlockServerQ2ETagSelection(t *testing.T) {
+	body := bytes.Repeat([]byte{'r'}, 48)
+	for _, tc := range []struct {
+		name    string
+		options []message.Option
+		valid   []byte
+	}{
+		{name: "valid application ETag", options: []message.Option{{ID: message.ETag, Value: []byte("version")}}, valid: []byte("version")},
+		{name: "absent ETag"},
+		{name: "empty ETag", options: []message.Option{{ID: message.ETag}}},
+		{name: "oversized ETag", options: []message.Option{{ID: message.ETag, Value: bytes.Repeat([]byte{'x'}, 9)}}},
+		{name: "duplicate ETag", options: []message.Option{{ID: message.ETag, Value: []byte("first")}, {ID: message.ETag, Value: []byte("second")}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writes := q2ServerResponseWrites(t, codes.Changed, body, tc.options...)
+			require.Len(t, writes, 3)
+			var first []byte
+			for _, write := range writes {
+				etag, err := write.options.GetBytes(message.ETag)
+				require.NoError(t, err)
+				if tc.valid != nil {
+					require.Equal(t, tc.valid, etag)
+				} else {
+					require.Len(t, etag, 8)
+				}
+				if first == nil {
+					first = etag
+				} else {
+					require.Equal(t, first, etag)
+				}
+			}
+		})
+	}
+
+	generated := func(code codes.Code, options ...message.Option) []byte {
+		writes := q2ServerResponseWrites(t, code, body, options...)
+		etag, err := writes[0].options.GetBytes(message.ETag)
+		require.NoError(t, err)
+		return etag
+	}
+	base := generated(codes.Changed, message.Option{ID: message.LocationPath, Value: []byte("west")})
+	require.NotEqual(t, base, generated(codes.Content, message.Option{ID: message.LocationPath, Value: []byte("west")}))
+	require.NotEqual(t, base, generated(codes.Changed, message.Option{ID: message.LocationPath, Value: []byte("east")}))
+
+	ordered := []message.Option{{ID: message.MaxAge, Value: []byte{1}}, {ID: message.LocationPath, Value: []byte("west")}}
+	reversed := []message.Option{ordered[1], ordered[0]}
+	require.Equal(t, generated(codes.Changed, ordered...), generated(codes.Changed, reversed...))
+	require.NotEqual(t,
+		generated(codes.Changed, message.Option{ID: message.LocationPath, Value: []byte("first")}, message.Option{ID: message.LocationPath, Value: []byte("second")}),
+		generated(codes.Changed, message.Option{ID: message.LocationPath, Value: []byte("second")}, message.Option{ID: message.LocationPath, Value: []byte("first")}),
+	)
+	require.NotEqual(t,
+		generated(codes.Changed, message.Option{ID: message.LocationPath, Value: []byte("ab")}),
+		generated(codes.Changed, message.Option{ID: message.LocationPath, Value: []byte("a")}, message.Option{ID: message.LocationPath, Value: []byte("b")}),
+	)
+}
+
+func TestQBlockServerQ2ResponsesStripApplicationBlockOptions(t *testing.T) {
+	applicationOptions := []message.Option{
+		{ID: message.QBlock1, Value: []byte{0}},
+		{ID: message.QBlock2, Value: []byte{0}},
+		{ID: message.Block1, Value: []byte{0}},
+		{ID: message.Block2, Value: []byte{0}},
+		{ID: message.Size1, Value: []byte{32}},
+		{ID: message.Size2, Value: []byte{32}},
+		{ID: message.RequestTag, Value: []byte("stale")},
+		{ID: message.ETag, Value: []byte("old-one")},
+		{ID: message.ETag, Value: []byte("old-two")},
+	}
+	for _, write := range q2ServerResponseWrites(t, codes.Changed, bytes.Repeat([]byte{'r'}, 32), applicationOptions...) {
+		requireCleanQ2ResponseOptions(t, write.options)
+	}
+
+	h := newServerHarness(t, qblock.DefaultManagerConfig(), qblockServerConfig{}, func(w *responsewriter.ResponseWriter[*Conn], _ *pool.Message) {
+		require.NoError(t, w.SetResponse(codes.Content, message.TextPlain, bytes.NewReader(bytes.Repeat([]byte{'r'}, 32)), applicationOptions...))
+	})
+	h.ingest(conGET(t, h, 70, 1, 0))
+	writes := h.session.writesSnapshot()
+	require.Len(t, writes, 1)
+	require.Equal(t, codes.Content, writes[0].code)
+	requireCleanQ2ResponseOptions(t, writes[0].options)
+}
+
 func TestQBlockServerTickSendsNextQ2SetWithRetainedToken(t *testing.T) {
 	mc := qblock.DefaultManagerConfig()
 	mc.Transfer.MaxPayloads = 1

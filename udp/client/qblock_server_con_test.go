@@ -79,6 +79,63 @@ func TestQBlockServerCONOffsetAndETag(t *testing.T) {
 	require.EqualValues(t, 3, pos)
 }
 
+func TestQBlockServerCONGeneratedETagIncludesResponseOptions(t *testing.T) {
+	body := bytes.Repeat([]byte{'r'}, 32)
+	responseETag := func(options ...message.Option) []byte {
+		h := newServerHarness(t, qblock.DefaultManagerConfig(), qblockServerConfig{}, func(w *responsewriter.ResponseWriter[*Conn], _ *pool.Message) {
+			require.NoError(t, w.SetResponse(codes.Content, message.TextPlain, bytes.NewReader(body), options...))
+		})
+		h.ingest(conGET(t, h, 70, 1, 0))
+		writes := h.session.writesSnapshot()
+		require.Len(t, writes, 1)
+		require.Equal(t, codes.Content, writes[0].code)
+		etag, err := writes[0].options.GetBytes(message.ETag)
+		require.NoError(t, err)
+		return etag
+	}
+	base := responseETag(message.Option{ID: message.LocationPath, Value: []byte("west")})
+	require.NotEqual(t, base, responseETag(message.Option{ID: message.LocationPath, Value: []byte("east")}))
+	ordered := []message.Option{{ID: message.MaxAge, Value: []byte{1}}, {ID: message.LocationPath, Value: []byte("west")}}
+	reversed := []message.Option{ordered[1], ordered[0]}
+	require.Equal(t, responseETag(ordered...), responseETag(reversed...))
+
+	h := newServerHarness(t, qblock.DefaultManagerConfig(), qblockServerConfig{}, func(w *responsewriter.ResponseWriter[*Conn], _ *pool.Message) {
+		require.NoError(t, w.SetResponse(codes.Content, message.TextPlain, bytes.NewReader(body), message.Option{ID: message.LocationPath, Value: []byte("west")}))
+	})
+	h.ingest(conGET(t, h, 70, 1, 0))
+	h.ingest(conGET(t, h, 71, 2, 16))
+	writes := h.session.writesSnapshot()
+	require.Len(t, writes, 2)
+	firstETag, err := writes[0].options.GetBytes(message.ETag)
+	require.NoError(t, err)
+	secondETag, err := writes[1].options.GetBytes(message.ETag)
+	require.NoError(t, err)
+	require.Equal(t, firstETag, secondETag)
+
+	for _, tc := range []struct {
+		name    string
+		options []message.Option
+	}{
+		{name: "absent"},
+		{name: "empty", options: []message.Option{{ID: message.ETag}}},
+		{name: "oversized", options: []message.Option{{ID: message.ETag, Value: bytes.Repeat([]byte{'x'}, 9)}}},
+		{name: "duplicate", options: []message.Option{{ID: message.ETag, Value: []byte("one")}, {ID: message.ETag, Value: []byte("two")}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newServerHarness(t, qblock.DefaultManagerConfig(), qblockServerConfig{}, func(w *responsewriter.ResponseWriter[*Conn], _ *pool.Message) {
+				require.NoError(t, w.SetResponse(codes.Content, message.TextPlain, bytes.NewReader(body), tc.options...))
+			})
+			h.ingest(conGET(t, h, 70, 1, 0))
+			writes := h.session.writesSnapshot()
+			require.Len(t, writes, 1)
+			require.Equal(t, codes.Content, writes[0].code)
+			etag, err := writes[0].options.GetBytes(message.ETag)
+			require.NoError(t, err)
+			require.Len(t, etag, 8)
+		})
+	}
+}
+
 func TestQBlockServerCONDuplicates(t *testing.T) {
 	calls := 0
 	h := newServerHarness(t, qblock.DefaultManagerConfig(), qblockServerConfig{}, func(w *responsewriter.ResponseWriter[*Conn], _ *pool.Message) {

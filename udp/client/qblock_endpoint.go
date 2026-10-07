@@ -289,6 +289,13 @@ func (m *qblockEndpointMember) feedback(key qblockProbeKey) bool {
 	qblockEndpointNotify(w)
 	return true
 }
+func (m *qblockEndpointMember) canFeedback(key qblockProbeKey) bool {
+	d := m.domain
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	s := m.stateLocked()
+	return !m.detached && !d.closed && s != nil && s.owner == m.id && s.gate.key == key && s.gate.bytes > 0
+}
 func (m *qblockEndpointMember) nextDeadline() (time.Time, bool) {
 	d := m.domain
 	d.mu.Lock()

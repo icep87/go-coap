@@ -23,6 +23,7 @@ type fakeQBlockClock struct {
 	timer      *fakeQBlockTimer
 	timers     []*fakeQBlockTimer
 	onNewTimer func()
+	onReset    func(id uint32, now time.Time, delay time.Duration, deadline time.Time)
 }
 
 func newFakeQBlockClock(now time.Time) *fakeQBlockClock { return &fakeQBlockClock{now: now} }
@@ -52,7 +53,7 @@ func (c *fakeQBlockClock) NewTimer() qblockTimer {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.newTimers++
-	c.timer = &fakeQBlockTimer{clock: c, ch: make(chan time.Time, 1)}
+	c.timer = &fakeQBlockTimer{id: c.newTimers, clock: c, ch: make(chan time.Time, 1)}
 	c.timers = append(c.timers, c.timer)
 	return c.timer
 }
@@ -101,6 +102,7 @@ func (c *fakeQBlockClock) deliverStale() {
 }
 
 type fakeQBlockTimer struct {
+	id       uint32
 	clock    *fakeQBlockClock
 	ch       chan time.Time
 	active   bool
@@ -120,9 +122,22 @@ func (c *fakeQBlockClock) stopCount() uint32 {
 func (t *fakeQBlockTimer) C() <-chan time.Time { return t.ch }
 func (t *fakeQBlockTimer) Reset(d time.Duration) {
 	t.clock.mu.Lock()
-	t.active = true
+	now := t.clock.now
 	t.deadline = t.clock.now.Add(d)
+	deadline := t.deadline
+	t.active = true
+	if !t.clock.now.Before(t.deadline) {
+		t.active = false
+		select {
+		case t.ch <- t.clock.now:
+		default:
+		}
+	}
+	onReset := t.clock.onReset
 	t.clock.mu.Unlock()
+	if onReset != nil {
+		onReset(t.id, now, d, deadline)
+	}
 }
 func (t *fakeQBlockTimer) Stop() bool {
 	t.clock.mu.Lock()

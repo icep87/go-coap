@@ -195,6 +195,41 @@ func TestQBlockOrdinaryFeedbackRequiresAttemptAndValidForm(t *testing.T) {
 	require.False(t, cc.acceptOrdinaryResponse(resp), "Reset is not a representation")
 	require.True(t, p.member.owns(1))
 }
+
+func TestQBlockOrdinaryPrematureResponseKeepsMIDUntilAttempt(t *testing.T) {
+	cc, clock := ordinaryEndpointConn(t)
+	req := cc.AcquireMessage(context.Background())
+	defer cc.ReleaseMessage(req)
+	req.SetCode(codes.GET)
+	req.SetType(message.Confirmable)
+	req.SetToken(message.Token{0x31})
+	req.SetMessageID(31)
+	p, err := cc.acquireOrdinary(req)
+	require.NoError(t, err)
+	defer p.finish(false, clock.Now())
+	closeFn, err := cc.prepareWriteMessage(req, func(_ *responsewriter.ResponseWriter[*Conn], _ *pool.Message) {}, p)
+	require.NoError(t, err)
+	defer closeFn()
+
+	resp := cc.AcquireMessage(context.Background())
+	defer cc.ReleaseMessage(resp)
+	resp.SetCode(codes.Content)
+	resp.SetType(message.Acknowledgement)
+	resp.SetToken(message.Token{0x31})
+	resp.SetMessageID(31)
+	require.False(t, cc.acceptOrdinaryResponse(resp), "feedback before the first write must be ignored")
+	elem, ok := cc.midHandlerContainer.Load(31)
+	require.True(t, ok, "the published MID must remain available until a write is attempted")
+	require.Same(t, p, elem.ordinary)
+	require.True(t, p.member.owns(1), "premature feedback must not settle the permit")
+
+	require.NoError(t, cc.writeOrdinary(req, p), "premature feedback must not cancel the initial request")
+	require.True(t, cc.acceptOrdinaryResponse(resp), "the same feedback is valid after the write attempt")
+	_, ok = cc.midHandlerContainer.Load(31)
+	require.False(t, ok)
+	require.False(t, p.member.owns(1))
+}
+
 func TestQBlockOrdinaryExpirationReclaimsMember(t *testing.T) {
 	cc, clock := ordinaryEndpointConn(t)
 	req := cc.AcquireMessage(context.Background())

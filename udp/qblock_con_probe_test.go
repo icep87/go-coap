@@ -14,6 +14,7 @@ import (
 	"github.com/plgd-dev/go-coap/v3/udp"
 	"github.com/plgd-dev/go-coap/v3/udp/client"
 	"github.com/plgd-dev/go-coap/v3/udp/coder"
+	udpServer "github.com/plgd-dev/go-coap/v3/udp/server"
 	"github.com/stretchr/testify/require"
 	"io"
 	"net"
@@ -82,6 +83,110 @@ func TestQBlockServerCONProbeUDP(t *testing.T) {
 			require.EqualValues(t, 1, probes.Load())
 			require.EqualValues(t, 1, gets.Load())
 			require.EqualValues(t, 1, posts.Load())
+		})
+	}
+}
+
+func TestQBlockProbeRefreshesServerInactivityDeadline(t *testing.T) {
+	const inactivityTimeout = 20 * time.Second
+
+	for _, qEnabled := range []bool{false, true} {
+		name := "q_disabled"
+		if qEnabled {
+			name = "q_enabled"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+
+			periodicTicks := make(chan func(time.Time) bool, 1)
+			newConnections := make(chan *client.Conn, 1)
+			evictions := make(chan *client.Conn, 1)
+			opts := []udpServer.Option{
+				options.WithInactivityMonitor(inactivityTimeout, func(cc *client.Conn) {
+					evictions <- cc
+					_ = cc.Close()
+				}),
+				options.WithOnNewConn(func(cc *client.Conn) { newConnections <- cc }),
+				options.WithPeriodicRunner(func(tick func(time.Time) bool) { periodicTicks <- tick }),
+				options.WithHandlerFunc(func(w *responsewriter.ResponseWriter[*client.Conn], _ *pool.Message) {
+					_ = w.SetResponse(codes.Content, message.TextPlain, bytes.NewReader([]byte("probe response")))
+				}),
+				options.WithBlockwise(false, blockwise.SZX16, time.Second),
+			}
+			if qEnabled {
+				sc := qblock.DefaultServerConfig()
+				sc.ProbingRate = 65536
+				opts = append(opts, options.WithQBlockServer(sc))
+			}
+
+			s := udp.NewServer(opts...)
+			l, err := coapNet.NewListenUDP("udp4", "127.0.0.1:0")
+			require.NoError(t, err)
+			done := make(chan error, 1)
+			go func() { done <- s.Serve(l) }()
+			defer func() {
+				s.Stop()
+				require.NoError(t, <-done)
+			}()
+
+			var tick func(time.Time) bool
+			select {
+			case tick = <-periodicTicks:
+			case <-ctx.Done():
+				require.FailNow(t, "server did not register its periodic callback")
+			}
+
+			clientOpts := []udp.Option{options.WithContext(ctx), options.WithBlockwise(false, blockwise.SZX16, time.Second)}
+			if qEnabled {
+				qc := qblock.DefaultClientConfig()
+				qc.Mode = qblock.Require
+				qc.ProbingRate = 65536
+				clientOpts = append(clientOpts, options.WithQBlock(qc))
+			}
+			cc, err := udp.Dial(l.LocalAddr().String(), clientOpts...)
+			require.NoError(t, err)
+			defer cc.Close()
+
+			require.NoError(t, cc.Ping(ctx))
+			var serverConn *client.Conn
+			select {
+			case serverConn = <-newConnections:
+			case <-ctx.Done():
+				require.FailNow(t, "server connection was not created")
+			}
+			lastActivity := time.Now()
+
+			if qEnabled {
+				// Keep the original activity deadline measurably earlier than the Q probe's deadline.
+				time.Sleep(25 * time.Millisecond)
+				supported, probeErr := cc.ProbeQBlock(ctx, "/probe")
+				require.NoError(t, probeErr)
+				require.True(t, supported)
+				probeActivity := time.Now()
+
+				// The server's actual expiration callback is driven with a time just beyond
+				// the first activity deadline. The Q probe must have refreshed that deadline.
+				require.True(t, tick(lastActivity.Add(inactivityTimeout+time.Millisecond)))
+				select {
+				case <-evictions:
+					t.Fatal("Q probe did not refresh the server inactivity deadline")
+				default:
+				}
+				require.NoError(t, serverConn.Context().Err())
+
+				require.True(t, tick(probeActivity.Add(inactivityTimeout+time.Millisecond)))
+			} else {
+				require.True(t, tick(lastActivity.Add(inactivityTimeout+time.Millisecond)))
+			}
+
+			select {
+			case evicted := <-evictions:
+				require.Same(t, serverConn, evicted)
+			case <-ctx.Done():
+				require.FailNow(t, "inactivity callback did not run")
+			}
+			require.Error(t, serverConn.Context().Err())
 		})
 	}
 }

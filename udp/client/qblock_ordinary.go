@@ -166,19 +166,36 @@ func (cc *Conn) acceptOrdinaryResponse(msg *pool.Message) bool {
 		if msg.Type() == message.Acknowledgement && (!p.con || msg.MessageID() != p.mid) {
 			continue
 		}
-		if p.member.feedback(1) {
-			p.finish(false, p.member.domain.clock.Now())
-			if p.con {
-				if elem, ok := cc.midHandlerContainer.LoadAndDelete(p.mid); ok {
-					elem.ReleaseMessage(cc)
-					resp := cc.AcquireMessage(cc.Context())
-					w := responsewriter.New(resp, cc)
-					elem.handler(w, msg)
-					cc.ReleaseMessage(w.Message())
-				}
+		var elem *midElement
+		if p.con {
+			if !p.member.canFeedback(1) {
+				// Do not detach an unsent MID. The response can be retried after
+				// the initial write has charged the ordinary permit.
+				continue
 			}
-			accepted = true
+			var ok bool
+			elem, ok = cc.midHandlerContainer.Load(p.mid)
+			if !ok || elem.ordinary != p || !cc.removeMIDHandlerIfMatch(p.mid, elem) {
+				// A stale response must not settle this permit or dispatch a
+				// callback belonging to a replacement MID element.
+				continue
+			}
 		}
+		if !p.member.feedback(1) {
+			if elem != nil {
+				elem.ReleaseMessage(cc)
+			}
+			continue
+		}
+		p.finish(false, p.member.domain.clock.Now())
+		if elem != nil {
+			elem.ReleaseMessage(cc)
+			resp := cc.AcquireMessage(cc.Context())
+			w := responsewriter.New(resp, cc)
+			elem.handler(w, msg)
+			cc.ReleaseMessage(w.Message())
+		}
+		accepted = true
 	}
 	return accepted
 }

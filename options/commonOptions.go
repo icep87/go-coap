@@ -307,7 +307,7 @@ func (o KeepAliveOpt[C]) toTCPCreateInactivityMonitor(onInactive TCPOnInactive) 
 
 func (o KeepAliveOpt[C]) toUDPCreateInactivityMonitor(onInactive UDPOnInactive) func() udpClient.InactivityMonitor {
 	return func() udpClient.InactivityMonitor {
-		keepalive := inactivity.NewKeepAlive(o.maxRetries, onInactive, func(cc *udpClient.Conn, receivePong func()) (func(), error) {
+		keepalive := inactivity.NewCoalescedKeepAlive(o.maxRetries, onInactive, func(cc *udpClient.Conn, receivePong func()) (func(), error) {
 			return cc.AsyncPing(receivePong)
 		})
 		return inactivity.New(o.timeout/time.Duration(o.maxRetries+1), keepalive.OnInactive)
@@ -364,7 +364,16 @@ func (o KeepAliveOpt[C]) UDPClientApply(cfg *udpClient.Config) {
 	}
 }
 
-// WithKeepAlive monitoring's client connection's.
+// WithKeepAlive configures inactivity probes. TCP probes remain synchronous.
+// UDP and DTLS server probes run asynchronously and coalesce to one pending
+// probe, whether Q-Block is enabled or not. Q-enabled probes use ordinary
+// endpoint admission and congestion accounting. With regular expiration
+// sweeps, the first probe is scheduled after timeout/(maxRetries+1); each
+// later sweep counts one retry. Eviction takes about that initial interval
+// plus maxRetries sweep periods, plus the cumulative time each probe spends
+// pending admission or its initial write. Sweep scheduling can add alignment
+// delay. UDP probes have no hard admission deadline, so a gate that never opens
+// can delay eviction indefinitely.
 func WithKeepAlive[C OnInactiveFunc](maxRetries uint32, timeout time.Duration, onInactive C) KeepAliveOpt[C] {
 	return KeepAliveOpt[C]{
 		maxRetries: maxRetries,

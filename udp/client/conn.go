@@ -100,19 +100,24 @@ type midElement struct {
 
 	private struct {
 		sync.Mutex
-		msg *pool.Message
+		msg                 *pool.Message
+		initialWritePending bool
+		terminal            bool
 	}
 }
 
 func (m *midElement) ReleaseMessage(cc *Conn) {
+	m.private.Lock()
+	msg := m.private.msg
+	m.private.msg = nil
+	m.private.initialWritePending = false
+	m.private.terminal = true
+	m.private.Unlock()
 	if m.ordinary != nil {
 		m.ordinary.finish(false, m.ordinary.member.domain.clock.Now())
 	}
-	m.private.Lock()
-	defer m.private.Unlock()
-	if m.private.msg != nil {
-		cc.ReleaseMessage(m.private.msg)
-		m.private.msg = nil
+	if msg != nil {
+		cc.ReleaseMessage(msg)
 	}
 }
 
@@ -126,13 +131,32 @@ func (m *midElement) IsExpired(now time.Time, maxRetransmit uint32) bool {
 }
 
 func (m *midElement) Retransmit(now time.Time, acknowledgeTimeout time.Duration) bool {
-	if now.After(m.start.Add(acknowledgeTimeout * time.Duration(m.retransmit.Load()+1))) {
+	m.private.Lock()
+	if m.private.initialWritePending || m.private.terminal {
+		m.private.Unlock()
+		return false
+	}
+	start := m.start
+	if now.After(start.Add(acknowledgeTimeout * time.Duration(m.retransmit.Load()+1))) {
 		m.retransmit.Inc()
+		m.private.Unlock()
 		// retransmit
 		return true
 	}
+	m.private.Unlock()
 	// wait for next retransmit
 	return false
+}
+
+func (m *midElement) completeInitialWrite(now time.Time) bool {
+	m.private.Lock()
+	defer m.private.Unlock()
+	if !m.private.initialWritePending || m.private.terminal || m.private.msg == nil {
+		return false
+	}
+	m.private.initialWritePending = false
+	m.start = now
+	return true
 }
 
 func (m *midElement) GetMessage(cc *Conn) (*pool.Message, bool, error) {
@@ -713,6 +737,7 @@ func (cc *Conn) prepareWriteMessage(req *pool.Message, handler HandlerFunc, perm
 	// Only confirmable messages ever match an message ID
 	switch req.Type() {
 	case message.Confirmable:
+		mid := req.MessageID()
 		msg := cc.AcquireMessage(req.Context())
 		if err := req.Clone(msg); err != nil {
 			cc.ReleaseMessage(msg)
@@ -727,21 +752,24 @@ func (cc *Conn) prepareWriteMessage(req *pool.Message, handler HandlerFunc, perm
 			})
 		}
 		deadline, _ := req.Context().Deadline()
-		if _, loaded := cc.storeMIDHandler(req.MessageID(), &midElement{
+		elem := &midElement{
 			handler:  handler,
 			ordinary: permit,
 			start:    time.Now(),
 			deadline: deadline,
 			private: struct {
 				sync.Mutex
-				msg *pool.Message
+				msg                 *pool.Message
+				initialWritePending bool
+				terminal            bool
 			}{msg: msg},
-		}); loaded {
+		}
+		if _, loaded := cc.storeMIDHandler(mid, elem); loaded {
 			closeFns.Execute()
-			return nil, fmt.Errorf("cannot insert mid(%v) handler: %w", req.MessageID(), coapErrors.ErrKeyAlreadyExists)
+			return nil, fmt.Errorf("cannot insert mid(%v) handler: %w", mid, coapErrors.ErrKeyAlreadyExists)
 		}
 		closeFns = append(closeFns, func() {
-			_, _ = cc.midHandlerContainer.LoadAndDelete(req.MessageID())
+			cc.removeMIDHandlerIfMatch(mid, elem)
 		})
 	case message.NonConfirmable:
 		/* TODO need to acquireOutstandingInteraction
@@ -843,16 +871,24 @@ func (cc *Conn) AsyncPing(receivedPong func()) (func(), error) {
 		return nil, err
 	}
 	req := cc.AcquireMessage(cc.Context())
+	defer cc.ReleaseMessage(req)
 	req.SetType(message.Confirmable)
 	req.SetCode(codes.Empty)
 	mid := cc.GetMessageID()
 	req.SetMessageID(mid)
 	permit, err := cc.acquireOrdinary(req)
 	if err != nil {
-		cc.ReleaseMessage(req)
 		return nil, err
 	}
-	if _, loaded := cc.storeMIDHandler(mid, &midElement{
+	retained := cc.AcquireMessage(req.Context())
+	if err := req.Clone(retained); err != nil {
+		cc.ReleaseMessage(retained)
+		if permit != nil {
+			permit.finish(false, permit.member.domain.clock.Now())
+		}
+		return nil, fmt.Errorf("cannot clone ping message: %w", err)
+	}
+	elem := &midElement{
 		ordinary: permit,
 		handler: func(_ *responsewriter.ResponseWriter[*Conn], r *pool.Message) {
 			if r.Type() == message.Reset || r.Type() == message.Acknowledgement {
@@ -863,17 +899,17 @@ func (cc *Conn) AsyncPing(receivedPong func()) (func(), error) {
 		deadline: time.Time{}, // no deadline
 		private: struct {
 			sync.Mutex
-			msg *pool.Message
-		}{msg: req},
-	}); loaded {
-		if permit != nil {
-			permit.finish(false, permit.member.domain.clock.Now())
-		}
-		cc.ReleaseMessage(req)
+			msg                 *pool.Message
+			initialWritePending bool
+			terminal            bool
+		}{msg: retained, initialWritePending: true},
+	}
+	if _, loaded := cc.storeMIDHandler(mid, elem); loaded {
+		elem.ReleaseMessage(cc)
 		return nil, fmt.Errorf("cannot insert mid(%v) handler: %w", mid, coapErrors.ErrKeyAlreadyExists)
 	}
 	removeMidHandler := func() {
-		if elem, ok := cc.midHandlerContainer.LoadAndDelete(mid); ok {
+		if cc.removeMIDHandlerIfMatch(mid, elem) {
 			elem.ReleaseMessage(cc)
 		}
 	}
@@ -881,6 +917,7 @@ func (cc *Conn) AsyncPing(receivedPong func()) (func(), error) {
 		removeMidHandler()
 		return nil, fmt.Errorf(errFmtWriteRequest, err)
 	}
+	elem.completeInitialWrite(time.Now())
 	return removeMidHandler, nil
 }
 
@@ -1200,8 +1237,7 @@ func (cc *Conn) handleSpecialMessages(r *pool.Message) bool {
 			if elem.ordinary != nil && !cc.validOrdinaryMIDFeedback(elem.ordinary, r) {
 				return false
 			}
-			elem, ok = cc.midHandlerContainer.LoadAndDelete(r.MessageID())
-			if !ok {
+			if !cc.removeMIDHandlerIfMatch(r.MessageID(), elem) {
 				return false
 			}
 			if elem.ordinary != nil {
@@ -1289,7 +1325,9 @@ func (cc *Conn) Done() <-chan struct{} {
 
 func (cc *Conn) checkMidHandlerContainer(now time.Time, maxRetransmit uint32, acknowledgeTimeout time.Duration, key int32, value *midElement) {
 	if value.IsExpired(now, maxRetransmit) {
-		cc.midHandlerContainer.Delete(key)
+		if !cc.removeMIDHandlerIfMatch(key, value) {
+			return
+		}
 		value.ReleaseMessage(cc)
 		if value.capability != nil {
 			value.capability.finish(false, context.DeadlineExceeded)
@@ -1302,7 +1340,9 @@ func (cc *Conn) checkMidHandlerContainer(now time.Time, maxRetransmit uint32, ac
 	}
 	msg, ok, err := value.GetMessage(cc)
 	if err != nil {
-		cc.midHandlerContainer.Delete(key)
+		if !cc.removeMIDHandlerIfMatch(key, value) {
+			return
+		}
 		value.ReleaseMessage(cc)
 		cc.errors(fmt.Errorf(errFmtWriteRequest, err))
 		return
@@ -1404,4 +1444,21 @@ func (cc *Conn) storeMIDHandler(mid int32, elem *midElement) (*midElement, bool)
 		}
 	}
 	return cc.midHandlerContainer.LoadOrStore(mid, elem)
+}
+
+// removeMIDHandlerIfMatch removes only the element that the caller validated.
+// The caller releases its message and permit after the container lock is free.
+func (cc *Conn) removeMIDHandlerIfMatch(mid int32, expected *midElement) bool {
+	removed := false
+	cc.midHandlerContainer.ReplaceWithFunc(mid, func(current *midElement, loaded bool) (*midElement, bool) {
+		if !loaded {
+			return current, true
+		}
+		if loaded && current == expected {
+			removed = true
+			return current, true
+		}
+		return current, false
+	})
+	return removed
 }
